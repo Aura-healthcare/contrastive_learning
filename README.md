@@ -1,5 +1,14 @@
 Started this work to study how we could could build an embedding which can capture the variability of seizure / non seizure but also the variability inter patients.
 
+This is based on following papers :
+
+SimCLR from google brain https://arxiv.org/abs/2002.05709 
+MoCo from facebook ai https://arxiv.org/abs/1911.05722
+
+Interesting paper on contrastive learning : https://arxiv.org/pdf/2010.05113
+
+Contrastive learning in ECG or EEG :  https://pubmed.ncbi.nlm.nih.gov/37028019/
+
 Work done on TUH dataset.
 
 ## Usage
