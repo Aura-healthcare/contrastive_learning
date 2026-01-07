@@ -1,5 +1,7 @@
 Started this work to study how we could could build an embedding which can capture the variability of seizure / non seizure but also the variability inter patients.
 
+Work done on TUH dataset.
+
 ## Usage
 Install uv
 ```bash
