@@ -1,0 +1,20 @@
+[project]
+name = "contrastive-learning"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "bokeh>=3.4.3",
+    "colorcet>=3.1.0",
+    "datashader>=0.17.0",
+    "holoviews>=1.20.2",
+    "matplotlib>=3.9.4",
+    "pandas>=2.3.1",
+    "plotly>=6.2.0",
+    "scikit-image>=0.24.0",
+    "scikit-learn>=1.6.1",
+    "torch>=2.7.1",
+    "tqdm>=4.67.1",
+    "umap-learn>=0.5.9.post2",
+]

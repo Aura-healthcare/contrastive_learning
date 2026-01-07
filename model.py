@@ -1,0 +1,162 @@
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Model which transforms a tensor of features into a tensor of embeddings in 256 dimensions
+class EmbeddingModel(nn.Module):
+    def __init__(self, input_dim, embedding_dim):
+        super(EmbeddingModel, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.bn1 = nn.BatchNorm1d(128)
+        self.fc2 = nn.Linear(128, 256)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.fc3 = nn.Linear(256, embedding_dim)
+        self.bn3 = nn.BatchNorm1d(embedding_dim)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.2)
+        
+        # Residual connections
+        self.residual1 = nn.Linear(input_dim, 128) if input_dim != 128 else nn.Identity()
+        self.residual2 = nn.Linear(128, 256) if 128 != 256 else nn.Identity()
+        self.residual3 = nn.Linear(256, embedding_dim) if 256 != embedding_dim else nn.Identity()
+
+    def forward(self, x):
+        # First layer with residual
+        identity1 = self.residual1(x)
+        out1 = self.relu(self.bn1(self.fc1(x)))
+        out1 = out1 + identity1  # Residual connection
+        out1 = self.dropout(out1)
+        
+        # Second layer with residual
+        identity2 = self.residual2(out1)
+        out2 = self.relu(self.bn2(self.fc2(out1)))
+        out2 = out2 + identity2  # Residual connection
+        out2 = self.dropout(out2)
+        
+        # Final layer with residual
+        identity3 = self.residual3(out2)
+        out3 = self.bn3(self.fc3(out2))
+        out3 = out3 + identity3  # Residual connection
+        
+        return out3
+
+# Alternative: Deep Residual Network
+class DeepResidualEmbeddingModel(nn.Module):
+    def __init__(self, input_dim, embedding_dim, num_blocks=3):
+        super(DeepResidualEmbeddingModel, self).__init__()
+        
+        self.input_layer = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+        
+        # Residual blocks at 256
+        self.residual_blocks_256 = nn.ModuleList()
+        for i in range(num_blocks):
+            self.residual_blocks_256.append(ResidualBlock(256, 256))
+        
+        # Expansion to 512 (if needed)
+        if embedding_dim >= 512:
+            self.expand_to_512 = nn.Sequential(
+                nn.Linear(256, 512),
+                nn.BatchNorm1d(512),
+                nn.ReLU(),
+                nn.Dropout(0.2)
+            )
+            
+            # Residual blocks at 512
+            self.residual_blocks_512 = nn.ModuleList()
+            for i in range(num_blocks):
+                self.residual_blocks_512.append(ResidualBlock(512, 512))
+        else:
+            self.expand_to_512 = nn.Identity()
+            self.residual_blocks_512 = nn.ModuleList()
+        
+        # Expansion to 1024 (if needed)
+        if embedding_dim >= 1024:
+            self.expand_to_1024 = nn.Sequential(
+                nn.Linear(512, 1024),
+                nn.BatchNorm1d(1024),
+                nn.ReLU(),
+                nn.Dropout(0.2)
+            )
+            
+            # Residual blocks at 1024
+            self.residual_blocks_1024 = nn.ModuleList()
+            for i in range(num_blocks):
+                self.residual_blocks_1024.append(ResidualBlock(1024, 1024))
+        else:
+            self.expand_to_1024 = nn.Identity()
+            self.residual_blocks_1024 = nn.ModuleList()
+        
+        # Output layer
+        if embedding_dim >= 1024:
+            self.output_layer = nn.Linear(1024, embedding_dim)
+        elif embedding_dim >= 512:
+            self.output_layer = nn.Linear(512, embedding_dim)
+        else:
+            self.output_layer = nn.Linear(256, embedding_dim)
+
+        self.projection_head = nn.Sequential(
+            nn.Linear(embedding_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+        
+    def forward(self, x, return_projection=False):
+        x = self.input_layer(x)
+        
+        # Process through 256 blocks
+        for block in self.residual_blocks_256:
+            x = block(x)
+        
+        # Expand to 512 if needed
+        if not isinstance(self.expand_to_512, nn.Identity):
+            x = self.expand_to_512(x)
+            
+            # Process through 512 blocks
+            for block in self.residual_blocks_512:
+                x = block(x)
+        
+        # Expand to 1024 if needed
+        if not isinstance(self.expand_to_1024, nn.Identity):
+            x = self.expand_to_1024(x)
+            
+            # Process through 1024 blocks
+            for block in self.residual_blocks_1024:
+                x = block(x)
+        x = self.output_layer(x)
+
+        embedding = self.output_layer(x)  # Base embedding
+        embedding = F.normalize(embedding, p=2, dim=1)
+
+        if return_projection:
+            projection = self.projection_head(embedding)
+            projection = F.normalize(projection, dim=1)  # L2-normalize for contrastive loss
+            return embedding, projection
+
+        return embedding
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super(ResidualBlock, self).__init__()
+        
+        self.layers = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.BatchNorm1d(out_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(out_dim, out_dim),
+            nn.BatchNorm1d(out_dim)
+        )
+        
+        # Shortcut connection (identity if same dimensions)
+        self.shortcut = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
+        self.relu = nn.ReLU()
+        
+    def forward(self, x):
+        residual = self.shortcut(x)
+        out = self.layers(x)
+        return self.relu(out + residual)
+
