@@ -77,9 +77,10 @@ def train_model_triplet_hard_negative(model, train_dataloader, optimizer, loss_f
             optimizer.zero_grad()
 
             embeddings = model(features)
-            
+
             # Pass embeddings to loss function
-            loss = loss_fn(embeddings, patient_ids)
+            # TODO: here we could learn on patient id and fine tune on labels with the classifier head
+            loss = loss_fn(embeddings, labels)
             epoch_loss += loss.item()
             loss.backward()
             optimizer.step()

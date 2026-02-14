@@ -14,6 +14,7 @@ import torch.nn as nn
 from functools import lru_cache
 import numpy as np
 import os
+import json
 from datetime import datetime
 from tqdm import tqdm
 
@@ -42,6 +43,31 @@ from config import (
     DEVICE_CONFIG,
     LOGGING_CONFIG
 )
+
+
+# ============================================================================
+# CONFIGURATION SAVING
+# ============================================================================
+
+def save_config_to_json(results_dir):
+    """Save all configuration to a JSON file in the results directory."""
+    config_dict = {
+        'data_config': DATA_CONFIG,
+        'model_config': MODEL_CONFIG,
+        'embedding_training_config': EMBEDDING_TRAINING_CONFIG,
+        'classifier_training_config': CLASSIFIER_TRAINING_CONFIG,
+        'eval_config': EVAL_CONFIG,
+        'device_config': DEVICE_CONFIG,
+        'logging_config': LOGGING_CONFIG,
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    config_path = os.path.join(results_dir, 'training_config.json')
+    with open(config_path, 'w') as f:
+        json.dump(config_dict, f, indent=4)
+
+    logging.info(f"Configuration saved to {config_path}")
+    return config_path
 
 
 # ============================================================================
@@ -391,6 +417,9 @@ def main():
     os.makedirs(results_dir, exist_ok=True)
     logging.info(f"Results will be saved to: {results_dir}\n")
 
+    # Save configuration to JSON
+    save_config_to_json(results_dir)
+
     # Load data for embedding training
     train_dataset_embedding, test_dataset_embedding, weights = load_train_test_dataset(
         csv_path=DATA_CONFIG['data_path'],
@@ -471,6 +500,7 @@ def main():
             logging.info(f"Final Test ROC-AUC: {test_metrics['roc_auc']:.4f}")
     logging.info(f"\nAll results saved to: {results_dir}")
     logging.info("Generated files:")
+    logging.info("  - training_config.json")
     logging.info("  - classifier_training_history.png")
     if EVAL_CONFIG['evaluate_on_train']:
         logging.info("  - train_evaluation_results.png")

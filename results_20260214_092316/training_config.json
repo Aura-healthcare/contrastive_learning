@@ -1,0 +1,67 @@
+{
+    "data_config": {
+        "data_path": "/Users/laura/Documents/aura/tuh_ecg_features2.csv",
+        "checkpoint_dir": "./checkpoints/",
+        "results_dir": null,
+        "num_patients_train": 10,
+        "use_weighted_sampling": true,
+        "drop_columns": [
+            "interval_index",
+            "interval_start_time",
+            "montage",
+            "session_id",
+            "file_id"
+        ],
+        "train_split_name": "train",
+        "test_split_name": "dev"
+    },
+    "model_config": {
+        "input_dim": 14,
+        "embedding_dim": 1024,
+        "num_classes": 2,
+        "num_residual_blocks": 3,
+        "classifier_hidden_dims": [
+            256,
+            64
+        ],
+        "classifier_dropout": 0.3
+    },
+    "embedding_training_config": {
+        "epochs": 10,
+        "batch_size": 1024,
+        "learning_rate": 0.005,
+        "loss_type": "batch_hard_triplet",
+        "margin": 1.0,
+        "temperature": 0.1,
+        "num_pairs": 5000,
+        "use_scheduler": true,
+        "scheduler_step_size": 7,
+        "scheduler_gamma": 0.3,
+        "save_checkpoints": true,
+        "checkpoint_frequency": 1
+    },
+    "classifier_training_config": {
+        "epochs": 20,
+        "batch_size": 128,
+        "learning_rate": 0.001,
+        "use_scheduler": true,
+        "scheduler_step_size": 5,
+        "scheduler_gamma": 0.5,
+        "freeze_embeddings": true
+    },
+    "eval_config": {
+        "evaluate_on_train": true,
+        "evaluate_on_test": true,
+        "generate_umap": true,
+        "umap_sample_size": 2000
+    },
+    "device_config": {
+        "use_cuda": true,
+        "cuda_device": 0
+    },
+    "logging_config": {
+        "level": "INFO",
+        "format": "%(asctime)s - %(levelname)s - %(message)s"
+    },
+    "timestamp": "2026-02-14 09:23:16"
+}
