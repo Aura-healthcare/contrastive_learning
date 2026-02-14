@@ -1,9 +1,11 @@
 import torch
+import torch.nn as nn
 import logging
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 import random
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score, confusion_matrix
 
 def train_model(model, train_dataloader, optimizer, loss_fn, device, epochs, scheduler, checkpoint_dir):
     model.train()
@@ -127,4 +129,116 @@ def plot_distance_distributions(pos_dists, neg_dists):
     plt.legend()
     plt.title('Distribution of Positive and Negative Distances')
     plt.savefig('./distance_distributions.png')
+
+
+def train_classifier(classifier, train_dataloader, optimizer, criterion, device, epochs, scheduler=None):
+    """Train the seizure classifier."""
+    classifier.train()
+    train_history = {'loss': [], 'accuracy': []}
+
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        all_preds = []
+        all_labels = []
+
+        for batch in tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}"):
+            features, labels, _ = batch
+            features, labels = features.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+
+            # Forward pass
+            logits = classifier(features)
+            loss = criterion(logits, labels)
+
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+
+            # Collect predictions
+            preds = torch.argmax(logits, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+        # Compute metrics
+        avg_loss = epoch_loss / len(train_dataloader)
+        accuracy = accuracy_score(all_labels, all_preds)
+
+        train_history['loss'].append(avg_loss)
+        train_history['accuracy'].append(accuracy)
+
+        logging.info(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
+
+        if scheduler:
+            scheduler.step()
+
+    return classifier, train_history
+
+
+def evaluate_classifier(classifier, dataloader, device):
+    """Evaluate the classifier and return comprehensive metrics."""
+    classifier.eval()
+    all_preds = []
+    all_labels = []
+    all_probs = []
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            features, labels, _ = batch
+            features, labels = features.to(device), labels.to(device)
+
+            logits = classifier(features)
+            probs = torch.softmax(logits, dim=1)
+
+            preds = torch.argmax(logits, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs[:, 1].cpu().numpy())  # Probability of positive class
+
+    # Compute metrics
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average='binary', zero_division=0
+    )
+
+    # Compute ROC-AUC if both classes are present
+    try:
+        roc_auc = roc_auc_score(all_labels, all_probs)
+    except ValueError:
+        roc_auc = None
+        logging.warning("ROC-AUC could not be computed (only one class present)")
+
+    # Confusion matrix
+    cm = confusion_matrix(all_labels, all_preds)
+
+    metrics = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'roc_auc': roc_auc,
+        'confusion_matrix': cm,
+        'predictions_probs': np.array(all_probs),
+        'true_labels': np.array(all_labels)
+    }
+
+    return metrics
+
+
+def print_evaluation_metrics(metrics, dataset_name="Test"):
+    """Pretty print evaluation metrics."""
+    logging.info(f"\n{'='*50}")
+    logging.info(f"{dataset_name} Set Evaluation Results")
+    logging.info(f"{'='*50}")
+    logging.info(f"Accuracy:  {metrics['accuracy']:.4f}")
+    logging.info(f"Precision: {metrics['precision']:.4f}")
+    logging.info(f"Recall:    {metrics['recall']:.4f}")
+    logging.info(f"F1 Score:  {metrics['f1']:.4f}")
+    if metrics['roc_auc'] is not None:
+        logging.info(f"ROC-AUC:   {metrics['roc_auc']:.4f}")
+    logging.info(f"\nConfusion Matrix:")
+    logging.info(f"{metrics['confusion_matrix']}")
+    logging.info(f"{'='*50}\n")
 

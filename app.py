@@ -1,37 +1,72 @@
+"""
+Contrastive Learning for Seizure Detection from Cardiac Features
+
+This script trains an embedding model using contrastive learning (batch hard triplet loss)
+and then trains a classifier on top of the learned embeddings to predict seizure/no-seizure.
+"""
+
 import pandas as pd
 import logging
 import torch
-from torch.utils.data import DataLoader, WeightedRandomSampler, Dataset
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import torch.optim as optim
-from model import EmbeddingModel, DeepResidualEmbeddingModel
-from loss import ContrastiveLoss, TripletLoss, BatchHardTripletLoss
-import os
-from dataset import ContrastiveDataset, TripletDataset, EmbeddingDataset
-from train import train_model, train_model_triplet, compute_distances, plot_distance_distributions, train_model_triplet_hard_negative
-import numpy as np
+import torch.nn as nn
 from functools import lru_cache
+import numpy as np
+import os
+from datetime import datetime
+from tqdm import tqdm
+
+from model import DeepResidualEmbeddingModel, SeizureClassifier
+from loss import BatchHardTripletLoss
+from dataset import EmbeddingDataset
+from train import (
+    train_model_triplet_hard_negative,
+    train_classifier,
+    evaluate_classifier,
+    print_evaluation_metrics
+)
+from visualization import plot_evaluation_results, plot_training_history, visualize_umap
+from config import (
+    DATA_CONFIG,
+    MODEL_CONFIG,
+    EMBEDDING_TRAINING_CONFIG,
+    CLASSIFIER_TRAINING_CONFIG,
+    EVAL_CONFIG,
+    DEVICE_CONFIG,
+    LOGGING_CONFIG
+)
+
+
+# ============================================================================
+# DATA LOADING
+# ============================================================================
 
 @lru_cache(maxsize=1)
-def load_train_test_dataset(csv_path) -> tuple[Dataset, Dataset, list[float]]:
-    csv_path = '/Users/laura/Documents/aura/tuh_ecg_features2.csv'  
+def load_train_test_dataset(csv_path):
+    """Load and preprocess the cardiac features dataset."""
+    logging.info(f"Loading dataset from {csv_path}")
     df = pd.read_csv(csv_path)
 
-    df.drop(columns=['interval_index', 'interval_start_time', 'montage', 'session_id', 'file_id'], inplace=True)
+    # Drop unnecessary columns
+    df.drop(columns=DATA_CONFIG['drop_columns'], inplace=True)
 
-    # Normalize data and convert to tensor
-    train_df = df[df['split'] == 'train'].drop(columns=['split'])
-    test_df = df[df['split'] == 'dev'].drop(columns=['split'])
+    # Split into train and test
+    train_df = df[df['split'] == DATA_CONFIG['train_split_name']].drop(columns=['split'])
+    test_df = df[df['split'] == DATA_CONFIG['test_split_name']].drop(columns=['split'])
 
-    # Remove 25% of majority class (label 0) randomly
-    # label_0_mask = train_df['label'] == 0
-    # remove_mask = label_0_mask & (np.random.random(len(train_df)) < 0.8)
-    # train_df = train_df[~remove_mask]
+    # Limit to subset of patients for faster experimentation
+    if DATA_CONFIG['num_patients_train'] is not None:
+        patient_ids_list = train_df['patient_id'].unique()
+        train_df = train_df[train_df['patient_id'].isin(
+            patient_ids_list[:DATA_CONFIG['num_patients_train']]
+        )]
 
-    # Only keep 3 patients in train
-    patient_ids_list = train_df['patient_id'].unique()
-    train_df = train_df[train_df['patient_id'].isin(patient_ids_list[:10])]
+    logging.info(f"Train samples: {len(train_df)}, Test samples: {len(test_df)}")
+    logging.info(f"Train label distribution:\n{train_df['label'].value_counts()}")
+    logging.info(f"Test label distribution:\n{test_df['label'].value_counts()}")
 
-    # Normalize features
+    # Normalize features using train statistics
     feature_columns = train_df.drop(columns=['label', 'patient_id']).columns
     train_mean = train_df[feature_columns].mean()
     train_std = train_df[feature_columns].std()
@@ -39,100 +74,313 @@ def load_train_test_dataset(csv_path) -> tuple[Dataset, Dataset, list[float]]:
     train_df[feature_columns] = (train_df[feature_columns] - train_mean) / train_std
     test_df[feature_columns] = (test_df[feature_columns] - train_mean) / train_std
 
-    # Create DataLoader
+    # Convert to tensors
     train_features = torch.tensor(train_df.drop(columns=['label', 'patient_id']).to_numpy(), dtype=torch.float32)
     train_labels = torch.tensor(train_df['label'].to_numpy(), dtype=torch.long)
+    train_patient_ids = torch.tensor(train_df['patient_id'].to_numpy(), dtype=torch.long)
+
     test_features = torch.tensor(test_df.drop(columns=['label', 'patient_id']).to_numpy(), dtype=torch.float32)
     test_labels = torch.tensor(test_df['label'].to_numpy(), dtype=torch.long)
-
-    train_patient_ids = torch.tensor(train_df['patient_id'].to_numpy(), dtype=torch.long)
     test_patient_ids = torch.tensor(test_df['patient_id'].to_numpy(), dtype=torch.long)
 
-    # train_dataset = ContrastiveDataset(train_features, train_labels, num_pairs=5000)
-    # test_dataset = ContrastiveDataset(test_features, test_labels, num_pairs=1000)
-
-    # train_dataset = TripletDataset(train_features, train_labels, train_patient_ids)
-    # test_dataset = TripletDataset(test_features, test_labels, test_patient_ids)
+    # Create datasets
     train_dataset = EmbeddingDataset(train_features, train_labels, train_patient_ids)
     test_dataset = EmbeddingDataset(test_features, test_labels, test_patient_ids)
 
-    # Compute sample weights inversely proportional to patient frequency to balance the dataset
+    # Compute sample weights inversely proportional to patient frequency
+    # This helps balance the dataset across patients
     patient_counts = train_df['patient_id'].value_counts()
     weights = train_df['patient_id'].apply(lambda x: 1.0 / patient_counts[x]).values
 
     return train_dataset, test_dataset, weights
-    
-    
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    train_dataset, test_dataset, weights = load_train_test_dataset(csv_path="/Users/laura/Documents/aura/tuh_ecg_features2.csv")
 
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
-    train_dataloader = DataLoader(train_dataset, batch_size=1024, sampler=sampler)
-    test_dataloader = DataLoader(test_dataset, batch_size=128, shuffle=True)
+# ============================================================================
+# EMBEDDING TRAINING
+# ============================================================================
 
-    net = DeepResidualEmbeddingModel(input_dim=14, embedding_dim=1024)
+def train_embedding_model(train_dataloader, device):
+    """Train the embedding model using contrastive learning."""
+    logging.info("=" * 80)
+    logging.info("PHASE 1: Training Embedding Model with Contrastive Learning")
+    logging.info("=" * 80)
 
-    device = 'cpu'
-    if torch.cuda.is_available():
-        device = torch.device('cuda:0')
-        
-    net = net.to(device)
+    # Initialize model
+    embedding_model = DeepResidualEmbeddingModel(
+        input_dim=MODEL_CONFIG['input_dim'],
+        embedding_dim=MODEL_CONFIG['embedding_dim'],
+        num_blocks=MODEL_CONFIG['num_residual_blocks']
+    ).to(device)
 
-    # Define the training configuration
-    # loss_fn = TripletLoss(margin=2.0)
-    loss_fn = BatchHardTripletLoss(margin=1.0)
-    optimizer = optim.Adam(net.parameters(), lr=5e-3)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.3)
+    # Loss and optimizer
+    loss_fn = BatchHardTripletLoss(margin=EMBEDDING_TRAINING_CONFIG['triplet_margin'])
+    optimizer = optim.Adam(
+        embedding_model.parameters(),
+        lr=EMBEDDING_TRAINING_CONFIG['learning_rate']
+    )
 
-    # Define a directory to save the checkpoints
-    checkpoint_dir = './checkpoints/'
+    # Learning rate scheduler
+    scheduler = None
+    if EMBEDDING_TRAINING_CONFIG['use_scheduler']:
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=EMBEDDING_TRAINING_CONFIG['scheduler_step_size'],
+            gamma=EMBEDDING_TRAINING_CONFIG['scheduler_gamma']
+        )
 
-    # Ensure the directory exists
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
+    # Ensure checkpoint directory exists
+    os.makedirs(DATA_CONFIG['checkpoint_dir'], exist_ok=True)
 
-    # train_model(
-    #     net,
-    #     train_dataloader,
-    #     optimizer,
-    #     loss_fn,
-    #     device,
-    #     epochs=30,
-    #     scheduler=scheduler,
-    #     checkpoint_dir=checkpoint_dir
-    # )
-
-    # train_model_triplet(
-    #     net,
-    #     train_dataloader,
-    #     optimizer,
-    #     loss_fn,
-    #     device,
-    #     epochs=30,
-    #     scheduler=scheduler,
-    #     checkpoint_dir=checkpoint_dir
-    # )
-
-    train_model_triplet_hard_negative(
-        net,
+    # Train
+    embedding_model, loss_list = train_model_triplet_hard_negative(
+        embedding_model,
         train_dataloader,
         optimizer,
         loss_fn,
         device,
-        epochs=30,
+        epochs=EMBEDDING_TRAINING_CONFIG['epochs'],
         scheduler=scheduler,
-        checkpoint_dir=checkpoint_dir
+        checkpoint_dir=DATA_CONFIG['checkpoint_dir']
     )
 
-    # pos_dists, neg_dists = compute_distances(
-    #     net,
-    #     train_dataloader,
-    #     device,
-    #     k=100
-    # )
-
-    # plot_distance_distributions(pos_dists, neg_dists)
+    logging.info("Embedding model training completed!\n")
+    return embedding_model
 
 
+# ============================================================================
+# UMAP VISUALIZATION
+# ============================================================================
+
+def generate_umap_visualizations(embedding_model, dataloader, device, results_dir, sample_size=None):
+    """Generate UMAP visualizations of the learned embeddings."""
+    logging.info("=" * 80)
+    logging.info("Generating UMAP Visualizations")
+    logging.info("=" * 80)
+
+    embedding_model.eval()
+    encoded_data = []
+    labels = []
+    patient_ids = []
+
+    with torch.no_grad():
+        for features, label, patient_id in tqdm(dataloader, desc="Generating embeddings"):
+            features = features.to(device)
+            embeddings = embedding_model(features)
+            encoded_data.extend(embeddings.cpu().numpy())
+            labels.extend(label.cpu().numpy())
+            patient_ids.extend(patient_id.cpu().numpy())
+
+    # Convert to numpy arrays
+    encoded_data = np.array(encoded_data)
+    labels = np.array(labels)
+    patient_ids = np.array(patient_ids)
+
+    # Sample if requested
+    if sample_size is not None and len(encoded_data) > sample_size:
+        logging.info(f"Sampling {sample_size} examples for UMAP visualization")
+        indices = np.random.choice(len(encoded_data), sample_size, replace=False)
+        encoded_data = encoded_data[indices]
+        labels = labels[indices]
+        patient_ids = patient_ids[indices]
+
+    logging.info(f"Generating UMAP plots with {len(encoded_data)} samples...")
+    visualize_umap(encoded_data, labels, patient_ids, results_dir)
+    logging.info("UMAP visualizations completed!\n")
+
+
+# ============================================================================
+# CLASSIFICATION
+# ============================================================================
+
+def train_and_evaluate_classifier(embedding_model, train_dataloader, test_dataloader, device, results_dir):
+    """Train classifier on learned embeddings and evaluate."""
+    logging.info("=" * 80)
+    logging.info("PHASE 2: Training Seizure Classifier")
+    logging.info("=" * 80)
+
+    # Initialize classifier
+    classifier = SeizureClassifier(
+        embedding_model=embedding_model,
+        embedding_dim=MODEL_CONFIG['embedding_dim'],
+        num_classes=MODEL_CONFIG['num_classes']
+    ).to(device)
+
+    # Optionally unfreeze embeddings for fine-tuning
+    if not CLASSIFIER_TRAINING_CONFIG['freeze_embeddings']:
+        logging.info("Unfreezing embedding model for fine-tuning...")
+        classifier.unfreeze_embedding_model()
+
+    # Loss and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(
+        classifier.parameters() if not CLASSIFIER_TRAINING_CONFIG['freeze_embeddings']
+        else classifier.classifier.parameters(),
+        lr=CLASSIFIER_TRAINING_CONFIG['learning_rate']
+    )
+
+    # Learning rate scheduler
+    scheduler = None
+    if CLASSIFIER_TRAINING_CONFIG['use_scheduler']:
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=CLASSIFIER_TRAINING_CONFIG['scheduler_step_size'],
+            gamma=CLASSIFIER_TRAINING_CONFIG['scheduler_gamma']
+        )
+
+    # Train classifier
+    classifier, train_history = train_classifier(
+        classifier,
+        train_dataloader,
+        optimizer,
+        criterion,
+        device,
+        epochs=CLASSIFIER_TRAINING_CONFIG['epochs'],
+        scheduler=scheduler
+    )
+
+    logging.info("\nClassifier training completed!\n")
+
+    # Plot training history
+    plot_training_history(
+        train_history,
+        save_path=os.path.join(results_dir, 'classifier_training_history.png')
+    )
+
+    # Evaluate on train set
+    train_metrics = None
+    if EVAL_CONFIG['evaluate_on_train']:
+        logging.info("Evaluating on training set...")
+        train_metrics = evaluate_classifier(classifier, train_dataloader, device)
+        print_evaluation_metrics(train_metrics, dataset_name="Train")
+
+        # Generate visualization
+        plot_evaluation_results(
+            train_metrics,
+            train_metrics['predictions_probs'],
+            train_metrics['true_labels'],
+            save_path=os.path.join(results_dir, 'train_evaluation_results.png')
+        )
+
+    # Evaluate on test set
+    test_metrics = None
+    if EVAL_CONFIG['evaluate_on_test']:
+        logging.info("Evaluating on test set...")
+        test_metrics = evaluate_classifier(classifier, test_dataloader, device)
+        print_evaluation_metrics(test_metrics, dataset_name="Test")
+
+        # Generate visualization
+        plot_evaluation_results(
+            test_metrics,
+            test_metrics['predictions_probs'],
+            test_metrics['true_labels'],
+            save_path=os.path.join(results_dir, 'test_evaluation_results.png')
+        )
+
+    return classifier, train_metrics, test_metrics
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def main():
+    """Main execution function."""
+    # Setup logging
+    logging.basicConfig(
+        level=getattr(logging, LOGGING_CONFIG['level']),
+        format=LOGGING_CONFIG['format']
+    )
+
+    # Set device
+    if DEVICE_CONFIG['use_cuda'] and torch.cuda.is_available():
+        device = torch.device(f"cuda:{DEVICE_CONFIG['cuda_device']}")
+    else:
+        device = torch.device('cpu')
+    logging.info(f"Using device: {device}\n")
+
+    # Create timestamped results directory
+    if DATA_CONFIG['results_dir'] is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_dir = f"./results_{timestamp}"
+    else:
+        results_dir = DATA_CONFIG['results_dir']
+
+    os.makedirs(results_dir, exist_ok=True)
+    logging.info(f"Results will be saved to: {results_dir}\n")
+
+    # Load data
+    train_dataset, test_dataset, weights = load_train_test_dataset(
+        csv_path=DATA_CONFIG['data_path']
+    )
+
+    # Create dataloaders
+    if DATA_CONFIG['use_weighted_sampling']:
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        train_dataloader_embedding = DataLoader(
+            train_dataset,
+            batch_size=EMBEDDING_TRAINING_CONFIG['batch_size'],
+            sampler=sampler
+        )
+    else:
+        train_dataloader_embedding = DataLoader(
+            train_dataset,
+            batch_size=EMBEDDING_TRAINING_CONFIG['batch_size'],
+            shuffle=True
+        )
+
+    train_dataloader_classifier = DataLoader(
+        train_dataset,
+        batch_size=CLASSIFIER_TRAINING_CONFIG['batch_size'],
+        shuffle=True
+    )
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=CLASSIFIER_TRAINING_CONFIG['batch_size'],
+        shuffle=False
+    )
+
+    # Phase 1: Train embedding model
+    embedding_model = train_embedding_model(train_dataloader_embedding, device)
+
+    # Generate UMAP visualizations
+    if EVAL_CONFIG['generate_umap']:
+        generate_umap_visualizations(
+            embedding_model,
+            train_dataloader_classifier,
+            device,
+            results_dir,
+            sample_size=EVAL_CONFIG['umap_sample_size']
+        )
+
+    # Phase 2: Train and evaluate classifier
+    classifier, train_metrics, test_metrics = train_and_evaluate_classifier(
+        embedding_model,
+        train_dataloader_classifier,
+        test_dataloader,
+        device,
+        results_dir
+    )
+
+    # Final summary
+    logging.info("=" * 80)
+    logging.info("TRAINING COMPLETE!")
+    logging.info("=" * 80)
+    if test_metrics is not None:
+        logging.info(f"Final Test Accuracy: {test_metrics['accuracy']:.4f}")
+        logging.info(f"Final Test F1 Score: {test_metrics['f1']:.4f}")
+        if test_metrics['roc_auc'] is not None:
+            logging.info(f"Final Test ROC-AUC: {test_metrics['roc_auc']:.4f}")
+    logging.info(f"\nAll results saved to: {results_dir}")
+    logging.info("Generated files:")
+    logging.info("  - classifier_training_history.png")
+    if EVAL_CONFIG['evaluate_on_train']:
+        logging.info("  - train_evaluation_results.png")
+    if EVAL_CONFIG['evaluate_on_test']:
+        logging.info("  - test_evaluation_results.png")
+    if EVAL_CONFIG['generate_umap']:
+        logging.info("  - umap_plot_labels.png")
+        logging.info("  - umap_plot_patient_ids.png")
+
+
+if __name__ == "__main__":
+    main()

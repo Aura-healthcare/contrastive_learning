@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -122,11 +123,10 @@ class DeepResidualEmbeddingModel(nn.Module):
         # Expand to 1024 if needed
         if not isinstance(self.expand_to_1024, nn.Identity):
             x = self.expand_to_1024(x)
-            
+
             # Process through 1024 blocks
             for block in self.residual_blocks_1024:
                 x = block(x)
-        x = self.output_layer(x)
 
         embedding = self.output_layer(x)  # Base embedding
         embedding = F.normalize(embedding, p=2, dim=1)
@@ -141,7 +141,7 @@ class DeepResidualEmbeddingModel(nn.Module):
 class ResidualBlock(nn.Module):
     def __init__(self, in_dim, out_dim):
         super(ResidualBlock, self).__init__()
-        
+
         self.layers = nn.Sequential(
             nn.Linear(in_dim, out_dim),
             nn.BatchNorm1d(out_dim),
@@ -150,13 +150,48 @@ class ResidualBlock(nn.Module):
             nn.Linear(out_dim, out_dim),
             nn.BatchNorm1d(out_dim)
         )
-        
+
         # Shortcut connection (identity if same dimensions)
         self.shortcut = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
         self.relu = nn.ReLU()
-        
+
     def forward(self, x):
         residual = self.shortcut(x)
         out = self.layers(x)
         return self.relu(out + residual)
+
+
+class SeizureClassifier(nn.Module):
+    """Classification head that uses frozen embeddings from embedding model."""
+    def __init__(self, embedding_model, embedding_dim, num_classes=2):
+        super(SeizureClassifier, self).__init__()
+        self.embedding_model = embedding_model
+
+        # Freeze the embedding model
+        for param in self.embedding_model.parameters():
+            param.requires_grad = False
+
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(embedding_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, num_classes)
+        )
+
+    def forward(self, x):
+        with torch.no_grad():
+            embeddings = self.embedding_model(x)
+        logits = self.classifier(embeddings)
+        return logits
+
+    def unfreeze_embedding_model(self):
+        """Unfreeze embedding model for fine-tuning."""
+        for param in self.embedding_model.parameters():
+            param.requires_grad = True
 
