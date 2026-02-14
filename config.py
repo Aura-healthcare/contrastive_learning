@@ -13,7 +13,7 @@ DATA_CONFIG = {
     'results_dir': None,  # Will be auto-generated with timestamp if None
 
     # Data preprocessing
-    'num_patients_train': 10,  # Limit training to N patients for quick experiments (None for all)
+    'num_patients_train': 3,  # Limit training to N patients for quick experiments (None for all)
     'use_weighted_sampling': True,  # Use weighted sampling to balance across patients
 
     # Features to drop
@@ -49,12 +49,17 @@ MODEL_CONFIG = {
 # ============================================================================
 
 EMBEDDING_TRAINING_CONFIG = {
-    'epochs': 5,
+    'epochs': 10,
     'batch_size': 1024,
     'learning_rate': 5e-3,
 
-    # Loss function
-    'triplet_margin': 1.0,
+    # Loss function options: 'contrastive', 'triplet', 'batch_hard_triplet'
+    'loss_type': 'contrastive',
+
+    # Loss function parameters
+    'margin': 1.0,              # For triplet and batch_hard_triplet
+    'temperature': 0.1,         # For contrastive loss
+    'num_pairs': 5000,          # For contrastive dataset
 
     # Learning rate scheduler
     'use_scheduler': True,

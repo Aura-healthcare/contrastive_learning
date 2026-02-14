@@ -18,15 +18,21 @@ from datetime import datetime
 from tqdm import tqdm
 
 from model import DeepResidualEmbeddingModel, SeizureClassifier
-from loss import BatchHardTripletLoss
-from dataset import EmbeddingDataset
+from loss import ContrastiveLoss, TripletLoss, BatchHardTripletLoss
+from dataset import ContrastiveDataset, TripletDataset, EmbeddingDataset
 from train import (
+    train_model,
+    train_model_triplet,
     train_model_triplet_hard_negative,
     train_classifier,
-    evaluate_classifier,
+    evaluate_classifier
+)
+from visualization import (
+    plot_evaluation_results,
+    plot_training_history,
+    visualize_umap,
     print_evaluation_metrics
 )
-from visualization import plot_evaluation_results, plot_training_history, visualize_umap
 from config import (
     DATA_CONFIG,
     MODEL_CONFIG,
@@ -42,10 +48,10 @@ from config import (
 # DATA LOADING
 # ============================================================================
 
-@lru_cache(maxsize=1)
-def load_train_test_dataset(csv_path):
+def load_train_test_dataset(csv_path, loss_type='batch_hard_triplet'):
     """Load and preprocess the cardiac features dataset."""
     logging.info(f"Loading dataset from {csv_path}")
+    logging.info(f"Using loss type: {loss_type}")
     df = pd.read_csv(csv_path)
 
     # Drop unnecessary columns
@@ -83,9 +89,27 @@ def load_train_test_dataset(csv_path):
     test_labels = torch.tensor(test_df['label'].to_numpy(), dtype=torch.long)
     test_patient_ids = torch.tensor(test_df['patient_id'].to_numpy(), dtype=torch.long)
 
-    # Create datasets
-    train_dataset = EmbeddingDataset(train_features, train_labels, train_patient_ids)
-    test_dataset = EmbeddingDataset(test_features, test_labels, test_patient_ids)
+    # Create datasets based on loss type
+    if loss_type == 'contrastive':
+        train_dataset = ContrastiveDataset(
+            train_features,
+            train_labels,
+            num_pairs=EMBEDDING_TRAINING_CONFIG['num_pairs']
+        )
+        test_dataset = ContrastiveDataset(
+            test_features,
+            test_labels,
+            num_pairs=1000
+        )
+    elif loss_type == 'triplet':
+        train_dataset = TripletDataset(train_features, train_labels, train_patient_ids)
+        test_dataset = TripletDataset(test_features, test_labels, test_patient_ids)
+    elif loss_type == 'batch_hard_triplet':
+        train_dataset = EmbeddingDataset(train_features, train_labels, train_patient_ids)
+        test_dataset = EmbeddingDataset(test_features, test_labels, test_patient_ids)
+    else:  # 'simple' - just features, labels, patient_ids (for classifier/evaluation)
+        train_dataset = EmbeddingDataset(train_features, train_labels, train_patient_ids)
+        test_dataset = EmbeddingDataset(test_features, test_labels, test_patient_ids)
 
     # Compute sample weights inversely proportional to patient frequency
     # This helps balance the dataset across patients
@@ -101,8 +125,10 @@ def load_train_test_dataset(csv_path):
 
 def train_embedding_model(train_dataloader, device):
     """Train the embedding model using contrastive learning."""
+    loss_type = EMBEDDING_TRAINING_CONFIG['loss_type']
+
     logging.info("=" * 80)
-    logging.info("PHASE 1: Training Embedding Model with Contrastive Learning")
+    logging.info(f"PHASE 1: Training Embedding Model with {loss_type.upper()} Loss")
     logging.info("=" * 80)
 
     # Initialize model
@@ -112,8 +138,15 @@ def train_embedding_model(train_dataloader, device):
         num_blocks=MODEL_CONFIG['num_residual_blocks']
     ).to(device)
 
-    # Loss and optimizer
-    loss_fn = BatchHardTripletLoss(margin=EMBEDDING_TRAINING_CONFIG['triplet_margin'])
+    # Select loss function based on config
+    if loss_type == 'contrastive':
+        loss_fn = ContrastiveLoss(temperature=EMBEDDING_TRAINING_CONFIG['temperature'])
+    elif loss_type == 'triplet':
+        loss_fn = TripletLoss(margin=EMBEDDING_TRAINING_CONFIG['margin'])
+    else:  # batch_hard_triplet
+        loss_fn = BatchHardTripletLoss(margin=EMBEDDING_TRAINING_CONFIG['margin'])
+
+    # Optimizer
     optimizer = optim.Adam(
         embedding_model.parameters(),
         lr=EMBEDDING_TRAINING_CONFIG['learning_rate']
@@ -131,17 +164,40 @@ def train_embedding_model(train_dataloader, device):
     # Ensure checkpoint directory exists
     os.makedirs(DATA_CONFIG['checkpoint_dir'], exist_ok=True)
 
-    # Train
-    embedding_model, loss_list = train_model_triplet_hard_negative(
-        embedding_model,
-        train_dataloader,
-        optimizer,
-        loss_fn,
-        device,
-        epochs=EMBEDDING_TRAINING_CONFIG['epochs'],
-        scheduler=scheduler,
-        checkpoint_dir=DATA_CONFIG['checkpoint_dir']
-    )
+    # Select training function based on loss type
+    if loss_type == 'contrastive':
+        embedding_model, loss_list = train_model(
+            embedding_model,
+            train_dataloader,
+            optimizer,
+            loss_fn,
+            device,
+            epochs=EMBEDDING_TRAINING_CONFIG['epochs'],
+            scheduler=scheduler,
+            checkpoint_dir=DATA_CONFIG['checkpoint_dir']
+        )
+    elif loss_type == 'triplet':
+        embedding_model, loss_list = train_model_triplet(
+            embedding_model,
+            train_dataloader,
+            optimizer,
+            loss_fn,
+            device,
+            epochs=EMBEDDING_TRAINING_CONFIG['epochs'],
+            scheduler=scheduler,
+            checkpoint_dir=DATA_CONFIG['checkpoint_dir']
+        )
+    else:  # batch_hard_triplet
+        embedding_model, loss_list = train_model_triplet_hard_negative(
+            embedding_model,
+            train_dataloader,
+            optimizer,
+            loss_fn,
+            device,
+            epochs=EMBEDDING_TRAINING_CONFIG['epochs'],
+            scheduler=scheduler,
+            checkpoint_dir=DATA_CONFIG['checkpoint_dir']
+        )
 
     logging.info("Embedding model training completed!\n")
     return embedding_model
@@ -163,7 +219,18 @@ def generate_umap_visualizations(embedding_model, dataloader, device, results_di
     patient_ids = []
 
     with torch.no_grad():
-        for features, label, patient_id in tqdm(dataloader, desc="Generating embeddings"):
+        for batch in tqdm(dataloader, desc="Generating embeddings"):
+            # Handle different dataset formats
+            if len(batch) == 3:  # EmbeddingDataset: (features, label, patient_id)
+                features, label, patient_id = batch
+            elif len(batch) == 4:  # ContrastiveDataset: (anchor, contrastive, distance, label)
+                features, _, _, label = batch
+                patient_id = torch.zeros_like(label)  # Dummy patient IDs
+            elif len(batch) == 5:  # TripletDataset: (anchor, positive, negative, label, patient_id)
+                features, _, _, label, patient_id = batch
+            else:
+                raise ValueError(f"Unexpected batch format with {len(batch)} elements")
+
             features = features.to(device)
             embeddings = embedding_model(features)
             encoded_data.extend(embeddings.cpu().numpy())
@@ -210,8 +277,24 @@ def train_and_evaluate_classifier(embedding_model, train_dataloader, test_datalo
         logging.info("Unfreezing embedding model for fine-tuning...")
         classifier.unfreeze_embedding_model()
 
-    # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
+    # Loss and optimizer with class weights to handle imbalance
+    # Compute class weights from training data
+    all_labels = []
+    for batch in train_dataloader:
+        # Handle different dataset formats
+        if len(batch) == 3:  # EmbeddingDataset
+            _, labels, _ = batch
+        elif len(batch) == 4:  # ContrastiveDataset
+            _, _, _, labels = batch
+        elif len(batch) == 5:  # TripletDataset
+            _, _, _, labels, _ = batch
+        all_labels.extend(labels.numpy())
+
+    class_counts = np.bincount(all_labels)
+    class_weights = torch.tensor(1.0 / class_counts, dtype=torch.float32).to(device)
+    logging.info(f"Class weights: {class_weights.cpu().numpy()}")
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = optim.Adam(
         classifier.parameters() if not CLASSIFIER_TRAINING_CONFIG['freeze_embeddings']
         else classifier.classifier.parameters(),
@@ -308,34 +391,50 @@ def main():
     os.makedirs(results_dir, exist_ok=True)
     logging.info(f"Results will be saved to: {results_dir}\n")
 
-    # Load data
-    train_dataset, test_dataset, weights = load_train_test_dataset(
-        csv_path=DATA_CONFIG['data_path']
+    # Load data for embedding training
+    train_dataset_embedding, test_dataset_embedding, weights = load_train_test_dataset(
+        csv_path=DATA_CONFIG['data_path'],
+        loss_type=EMBEDDING_TRAINING_CONFIG['loss_type']
     )
 
-    # Create dataloaders
+    # Always load simple datasets for classification (regardless of embedding loss type)
+    # Note: 'simple' just loads features/labels/patient_ids - no loss is applied here
+    train_dataset_classifier, test_dataset_classifier, _ = load_train_test_dataset(
+        csv_path=DATA_CONFIG['data_path'],
+        loss_type='simple'  # Simple format: (features, labels, patient_ids)
+    )
+
+    # Create dataloaders for embedding training
     if DATA_CONFIG['use_weighted_sampling']:
         sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
         train_dataloader_embedding = DataLoader(
-            train_dataset,
+            train_dataset_embedding,
             batch_size=EMBEDDING_TRAINING_CONFIG['batch_size'],
             sampler=sampler
         )
     else:
         train_dataloader_embedding = DataLoader(
-            train_dataset,
+            train_dataset_embedding,
             batch_size=EMBEDDING_TRAINING_CONFIG['batch_size'],
             shuffle=True
         )
 
+    # Create dataloaders for classification (always use simple format)
     train_dataloader_classifier = DataLoader(
-        train_dataset,
+        train_dataset_classifier,
         batch_size=CLASSIFIER_TRAINING_CONFIG['batch_size'],
         shuffle=True
     )
-    test_dataloader = DataLoader(
-        test_dataset,
+    test_dataloader_classifier = DataLoader(
+        test_dataset_classifier,
         batch_size=CLASSIFIER_TRAINING_CONFIG['batch_size'],
+        shuffle=False
+    )
+
+    # For UMAP, use the classifier dataloader (simple format)
+    train_dataloader_umap = DataLoader(
+        train_dataset_classifier,
+        batch_size=128,
         shuffle=False
     )
 
@@ -346,7 +445,7 @@ def main():
     if EVAL_CONFIG['generate_umap']:
         generate_umap_visualizations(
             embedding_model,
-            train_dataloader_classifier,
+            train_dataloader_umap,
             device,
             results_dir,
             sample_size=EVAL_CONFIG['umap_sample_size']
@@ -356,7 +455,7 @@ def main():
     classifier, train_metrics, test_metrics = train_and_evaluate_classifier(
         embedding_model,
         train_dataloader_classifier,
-        test_dataloader,
+        test_dataloader_classifier,
         device,
         results_dir
     )
