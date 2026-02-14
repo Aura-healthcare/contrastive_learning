@@ -79,15 +79,16 @@ EMBEDDING_TRAINING_CONFIG = {
 CLASSIFIER_TRAINING_CONFIG = {
     'epochs': 20,
     'batch_size': 128,
-    'learning_rate': 1e-3,
+    'learning_rate': 1e-4,  # Lower LR for fine-tuning (was 1e-3)
 
     # Learning rate scheduler
     'use_scheduler': True,
     'scheduler_step_size': 5,
     'scheduler_gamma': 0.5,
 
-    # Fine-tuning options
-    'freeze_embeddings': True,  # If False, will fine-tune embedding model during classifier training
+    # Fine-tuning options (Two-stage approach)
+    'freeze_embeddings': False,  # Stage 2: Fine-tune patient embeddings for seizure detection
+    'unfreeze_last_n_blocks': None,  # None = all layers, or int (1,2,3) for partial unfreezing
 }
 
 
