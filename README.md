@@ -74,4 +74,7 @@ Lowering margin to 0.5 gives an embedding that separates better the labels than 
 UMAP on 25 patients with plotly shows complex problem.
 Need to do umap for each patient.
 
-TODO : test unfreezing embeddings during classification training in order to really "fine tune" the embeddings.
+### Things to experiment
+Multi-stage transfer learning approach:                                                                                
+  1. Phase 1: Learn rich patient embeddings (discriminate between patients)                                                                       
+  2. Phase 2: Fine-tune for seizure detection (unfreeze some layers)

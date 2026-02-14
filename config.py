@@ -13,7 +13,7 @@ DATA_CONFIG = {
     'results_dir': None,  # Will be auto-generated with timestamp if None
 
     # Data preprocessing
-    'num_patients_train': 3,  # Limit training to N patients for quick experiments (None for all)
+    'num_patients_train': 10,  # Limit training to N patients for quick experiments (None for all)
     'use_weighted_sampling': True,  # Use weighted sampling to balance across patients
 
     # Features to drop
