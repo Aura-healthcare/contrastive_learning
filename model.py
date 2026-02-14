@@ -190,8 +190,38 @@ class SeizureClassifier(nn.Module):
         logits = self.classifier(embeddings)
         return logits
 
-    def unfreeze_embedding_model(self):
-        """Unfreeze embedding model for fine-tuning."""
-        for param in self.embedding_model.parameters():
-            param.requires_grad = True
+    def unfreeze_embedding_model(self, last_n_blocks=None):
+        """Unfreeze embedding model for fine-tuning.
+
+        Args:
+            last_n_blocks: If None, unfreeze all layers.
+                          If int, only unfreeze the last N residual blocks.
+        """
+        if last_n_blocks is None:
+            # Unfreeze everything
+            for param in self.embedding_model.parameters():
+                param.requires_grad = True
+        else:
+            # Partial unfreezing: only unfreeze last N blocks
+            # Keep input layers and early blocks frozen
+
+            # Unfreeze output layer
+            for param in self.embedding_model.output_layer.parameters():
+                param.requires_grad = True
+
+            # Unfreeze last N blocks from each stage (1024, 512, 256)
+            if hasattr(self.embedding_model, 'residual_blocks_1024'):
+                for block in self.embedding_model.residual_blocks_1024[-last_n_blocks:]:
+                    for param in block.parameters():
+                        param.requires_grad = True
+
+            if last_n_blocks > 1 and hasattr(self.embedding_model, 'residual_blocks_512'):
+                for block in self.embedding_model.residual_blocks_512[-last_n_blocks:]:
+                    for param in block.parameters():
+                        param.requires_grad = True
+
+            if last_n_blocks > 2 and hasattr(self.embedding_model, 'residual_blocks_256'):
+                for block in self.embedding_model.residual_blocks_256[-last_n_blocks:]:
+                    for param in block.parameters():
+                        param.requires_grad = True
 

@@ -300,8 +300,12 @@ def train_and_evaluate_classifier(embedding_model, train_dataloader, test_datalo
 
     # Optionally unfreeze embeddings for fine-tuning
     if not CLASSIFIER_TRAINING_CONFIG['freeze_embeddings']:
-        logging.info("Unfreezing embedding model for fine-tuning...")
-        classifier.unfreeze_embedding_model()
+        n_blocks = CLASSIFIER_TRAINING_CONFIG.get('unfreeze_last_n_blocks', None)
+        if n_blocks is None:
+            logging.info("Unfreezing ALL embedding layers for fine-tuning...")
+        else:
+            logging.info(f"Unfreezing last {n_blocks} residual blocks for fine-tuning...")
+        classifier.unfreeze_embedding_model(last_n_blocks=n_blocks)
 
     # Loss and optimizer with class weights to handle imbalance
     # Compute class weights from training data
