@@ -18,6 +18,8 @@ Install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
+Update the conf file `contrastive_learning/config.py` to experiment.
+
 Launch training of embedding and classification head
 ```bash
 uv run python app.py
