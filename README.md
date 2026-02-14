@@ -10,6 +10,7 @@ Interesting paper on contrastive learning : https://arxiv.org/pdf/2010.05113
 Contrastive learning in ECG or EEG :  https://pubmed.ncbi.nlm.nih.gov/37028019/
 
 Work done on TUH dataset.
+You can see an example of the training run in [this folder](results_20260214_090530) (example work).
 
 ## Usage
 Install uv
@@ -17,7 +18,7 @@ Install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Launch training of embedding
+Launch training of embedding and classification head
 ```bash
 uv run python app.py
 ```

@@ -54,7 +54,7 @@ EMBEDDING_TRAINING_CONFIG = {
     'learning_rate': 5e-3,
 
     # Loss function options: 'contrastive', 'triplet', 'batch_hard_triplet'
-    'loss_type': 'contrastive',
+    'loss_type': 'batch_hard_triplet',
 
     # Loss function parameters
     'margin': 1.0,              # For triplet and batch_hard_triplet
