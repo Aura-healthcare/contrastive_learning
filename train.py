@@ -3,7 +3,6 @@ import torch.nn as nn
 import logging
 from tqdm import tqdm
 import numpy as np
-import matplotlib.pyplot as plt
 import random
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score, confusion_matrix
 
@@ -120,17 +119,6 @@ def compute_distances(model, dataloader, device='cpu', k=10):
     return np.array(pos_dists), np.array(neg_dists)
 
 
-def plot_distance_distributions(pos_dists, neg_dists):
-    plt.figure(figsize=(8,5))
-    plt.hist(pos_dists, alpha=0.6, label='Positive Distances')
-    plt.hist(neg_dists, alpha=0.6, label='Negative Distances')
-    plt.xlabel('Distance')
-    plt.ylabel('Count')
-    plt.legend()
-    plt.title('Distribution of Positive and Negative Distances')
-    plt.savefig('./distance_distributions.png')
-
-
 def train_classifier(classifier, train_dataloader, optimizer, criterion, device, epochs, scheduler=None):
     """Train the seizure classifier."""
     classifier.train()
@@ -225,20 +213,4 @@ def evaluate_classifier(classifier, dataloader, device):
     }
 
     return metrics
-
-
-def print_evaluation_metrics(metrics, dataset_name="Test"):
-    """Pretty print evaluation metrics."""
-    logging.info(f"\n{'='*50}")
-    logging.info(f"{dataset_name} Set Evaluation Results")
-    logging.info(f"{'='*50}")
-    logging.info(f"Accuracy:  {metrics['accuracy']:.4f}")
-    logging.info(f"Precision: {metrics['precision']:.4f}")
-    logging.info(f"Recall:    {metrics['recall']:.4f}")
-    logging.info(f"F1 Score:  {metrics['f1']:.4f}")
-    if metrics['roc_auc'] is not None:
-        logging.info(f"ROC-AUC:   {metrics['roc_auc']:.4f}")
-    logging.info(f"\nConfusion Matrix:")
-    logging.info(f"{metrics['confusion_matrix']}")
-    logging.info(f"{'='*50}\n")
 

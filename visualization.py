@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import logging
 from sklearn.decomposition import PCA
 from sklearn.metrics import roc_curve
 from tqdm import tqdm
@@ -18,17 +19,20 @@ import os
 import time
 
 def visualize_umap(encoded_data, labels, patient_ids, results_dir):
+    # Ensure results directory exists
+    os.makedirs(results_dir, exist_ok=True)
+
     print("Computing UMAP embedding...")
     mapper = umap.UMAP(random_state=42, metric='cosine', n_neighbors=15, min_dist=0.1).fit(encoded_data)
     print("UMAP computation completed!")
-    
+
     print("Creating UMAP plots...")
     umap.plot.points(mapper, labels=patient_ids)
-    plt.savefig(os.path.join(results_dir, 'umap_plot_patient_ids.png'))
+    plt.savefig(os.path.join(results_dir, 'umap_plot_patient_ids.png'), dpi=300, bbox_inches='tight')
     plt.close()
-    
+
     umap.plot.points(mapper, labels=labels)
-    plt.savefig(os.path.join(results_dir, 'umap_plot_labels.png'))
+    plt.savefig(os.path.join(results_dir, 'umap_plot_labels.png'), dpi=300, bbox_inches='tight')
     plt.close()
     print("UMAP plots saved!")
 
@@ -167,6 +171,49 @@ def plot_training_history(train_history, save_path='./training_history.png'):
 
     print(f"Training history saved to {save_path}")
     return save_path
+
+
+def plot_distance_distributions(pos_dists, neg_dists, save_path='./distance_distributions.png'):
+    """
+    Plot distribution of positive and negative distances.
+
+    Args:
+        pos_dists: Array of positive pair distances
+        neg_dists: Array of negative pair distances
+        save_path: Path to save the figure
+    """
+    plt.figure(figsize=(8, 5))
+    plt.hist(pos_dists, alpha=0.6, label='Positive Distances')
+    plt.hist(neg_dists, alpha=0.6, label='Negative Distances')
+    plt.xlabel('Distance')
+    plt.ylabel('Count')
+    plt.legend()
+    plt.title('Distribution of Positive and Negative Distances')
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
+
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"Distance distributions saved to {save_path}")
+    return save_path
+
+
+def print_evaluation_metrics(metrics, dataset_name="Test"):
+    """Pretty print evaluation metrics."""
+    logging.info(f"\n{'='*50}")
+    logging.info(f"{dataset_name} Set Evaluation Results")
+    logging.info(f"{'='*50}")
+    logging.info(f"Accuracy:  {metrics['accuracy']:.4f}")
+    logging.info(f"Precision: {metrics['precision']:.4f}")
+    logging.info(f"Recall:    {metrics['recall']:.4f}")
+    logging.info(f"F1 Score:  {metrics['f1']:.4f}")
+    if metrics['roc_auc'] is not None:
+        logging.info(f"ROC-AUC:   {metrics['roc_auc']:.4f}")
+    logging.info(f"\nConfusion Matrix:")
+    logging.info(f"{metrics['confusion_matrix']}")
+    logging.info(f"{'='*50}\n")
 
 
 # if __name__ == "__main__":
