@@ -1,45 +1,72 @@
 """
 Configuration file for contrastive learning seizure detection pipeline.
+
+Supports two dataset formats:
+  - 'tuh': TUH ECG features (14 HRV features, columns: patient_id, split, label)
+  - 'teppe': Teppe dataset (29 HRV + 141 ACC features, columns: patient-id, training-split, label)
+
+Set DATASET_FORMAT below to switch between them.
 """
+
+# ============================================================================
+# DATASET FORMAT — set this to 'tuh' or 'teppe'
+# ============================================================================
+DATASET_FORMAT = 'teppe'
 
 # ============================================================================
 # DATA CONFIGURATION
 # ============================================================================
 
-DATA_CONFIG = {
-    # Data paths
+# --- TUH format ---
+_TUH_DATA_CONFIG = {
     'data_path': '/Users/laura/Documents/aura/tuh_ecg_features2.csv',
-    'checkpoint_dir': './checkpoints/',
-    'results_dir': None,  # Will be auto-generated with timestamp if None
-
-    # Data preprocessing
-    'num_patients_train': None,  # Limit training to N patients for quick experiments (None for all)
-    'use_weighted_sampling': True,  # Use weighted sampling to balance across patients
-
-    # Features to drop
-    'drop_columns': ['interval_index', 'interval_start_time', 'montage', 'session_id', 'file_id'],
-
-    # Data splits
+    'patient_id_col': 'patient_id',
+    'label_col': 'label',
+    'split_col': 'split',
     'train_split_name': 'train',
     'test_split_name': 'dev',
+    'drop_columns': ['interval_index', 'interval_start_time', 'montage', 'session_id', 'file_id'],
+    'availability_cols': [],  # TUH has no availability flags
 }
+
+# --- Teppe format ---
+_TEPPE_DATA_CONFIG = {
+    'data_path': '/Users/laura/Documents/aura/teppe_dummy_multipatient.csv',
+    'patient_id_col': 'patient-id',
+    'label_col': 'label',
+    'split_col': 'training-split',
+    'train_split_name': 'train',
+    'test_split_name': 'test',
+    'drop_columns': ['timestamps', 'hrv_interval_index', 'hrv_interval_start_time'],
+    'availability_cols': ['hrv_available', 'acc_available'],  # sensor availability flags
+}
+
+# Merge with shared settings
+_SHARED_DATA_CONFIG = {
+    'checkpoint_dir': './checkpoints/',
+    'results_dir': None,  # Auto-generated with timestamp if None
+    'num_patients_train': None,  # Limit training patients (None for all)
+    'use_weighted_sampling': True,
+    'per_patient_normalization': True,  # z-score features relative to each patient's baseline
+}
+
+DATA_CONFIG = {**_SHARED_DATA_CONFIG, **(_TEPPE_DATA_CONFIG if DATASET_FORMAT == 'teppe' else _TUH_DATA_CONFIG)}
 
 
 # ============================================================================
 # MODEL CONFIGURATION
 # ============================================================================
 
+# input_dim is computed automatically from the data in launch_train.py
+# Set to None for auto-detection, or override with an int.
 MODEL_CONFIG = {
-    # Input/output dimensions
-    'input_dim': 14,
-    'embedding_dim': 128,
+    'input_dim': None,  # Auto-detected from data
+    'embedding_dim': 64,  # Reduced from 128 (better for generalisation)
     'num_classes': 2,
 
-    # Embedding model architecture
-    'num_residual_blocks': 3,  # Number of residual blocks in each stage
+    'num_residual_blocks': 2,  # Reduced from 3
 
-    # Classifier architecture
-    'classifier_hidden_dims': [64, 32],  # Hidden layer sizes in classifier head
+    'classifier_hidden_dims': [64, 32],
     'classifier_dropout': 0.3,
 }
 
@@ -49,16 +76,16 @@ MODEL_CONFIG = {
 # ============================================================================
 
 EMBEDDING_TRAINING_CONFIG = {
-    'epochs': 30,
+    'epochs': 5,  # Set low for testing (use 30+ for real training)
     'batch_size': 1024,
-    'learning_rate': 5e-3,
+    'learning_rate': 1e-3,  # Reduced from 5e-3
 
     # Loss function options: 'contrastive', 'triplet', 'batch_hard_triplet', 'supcon'
     'loss_type': 'supcon',
 
     # Loss function parameters
     'margin': 1.0,              # For triplet and batch_hard_triplet
-    'temperature': 0.3,         # For contrastive loss
+    'temperature': 0.07,        # Reduced from 0.3 — sharper focus on hard negatives
     'num_pairs': 5000,          # For contrastive dataset
     'pk_p': 8,                  # PKBatchSampler: number of patients per batch (supcon)
     'pk_k': 16,                 # PKBatchSampler: number of samples per patient per batch (supcon)
@@ -79,9 +106,9 @@ EMBEDDING_TRAINING_CONFIG = {
 # ============================================================================
 
 CLASSIFIER_TRAINING_CONFIG = {
-    'epochs': 20,
+    'epochs': 5,  # Set low for testing (use 20+ for real training)
     'batch_size': 128,
-    'learning_rate': 1e-4,  # Lower LR for fine-tuning (was 1e-3)
+    'learning_rate': 1e-4,
 
     # Learning rate scheduler
     'use_scheduler': True,
@@ -89,8 +116,8 @@ CLASSIFIER_TRAINING_CONFIG = {
     'scheduler_gamma': 0.5,
 
     # Fine-tuning options (Two-stage approach)
-    'freeze_embeddings': False,  # Stage 2: Fine-tune patient embeddings for seizure detection
-    'unfreeze_last_n_blocks': None,  # None = all layers, or int (1,2,3) for partial unfreezing
+    'freeze_embeddings': True,  # Changed: freeze embeddings by default
+    'unfreeze_last_n_blocks': None,
 }
 
 

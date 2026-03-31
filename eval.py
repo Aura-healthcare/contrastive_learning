@@ -46,33 +46,78 @@ from config import EVAL_CONFIG
 # DATA LOADING
 # ============================================================================
 
+def _encode_patient_ids(series):
+    """Map patient IDs (possibly strings like '01-001') to integer codes."""
+    codes, _ = pd.factorize(series)
+    return codes
+
+
+def _per_patient_normalize(df, feature_cols, pid_col, label_col):
+    """Z-score each feature relative to the patient's non-seizure baseline."""
+    df = df.copy()
+    for pid, grp in df.groupby(pid_col):
+        baseline = grp[grp[label_col] == 0]
+        if len(baseline) < 2:
+            baseline = grp
+        pmean = baseline[feature_cols].mean()
+        pstd = baseline[feature_cols].std().replace(0, 1)
+        df.loc[grp.index, feature_cols] = (grp[feature_cols] - pmean) / pstd
+    return df
+
+
 def load_data(config):
     """
     Reload train/test splits using the exact same preprocessing as training.
     Returns numpy arrays: train_feats, train_labels, train_pids, test_feats, test_labels, test_pids.
     """
     data_cfg = config["data_config"]
-    df = pd.read_csv(data_cfg["data_path"])
-    df.drop(columns=data_cfg["drop_columns"], inplace=True)
+    pid_col = data_cfg.get("patient_id_col", "patient_id")
+    label_col = data_cfg.get("label_col", "label")
+    split_col = data_cfg.get("split_col", "split")
+    avail_cols = data_cfg.get("availability_cols", [])
 
-    train_df = df[df["split"] == data_cfg["train_split_name"]].drop(columns=["split"])
-    test_df = df[df["split"] == data_cfg["test_split_name"]].drop(columns=["split"])
+    df = pd.read_csv(data_cfg["data_path"])
+    drop_cols = [c for c in data_cfg["drop_columns"] if c in df.columns]
+    df.drop(columns=drop_cols, inplace=True)
+
+    train_df = df[df[split_col] == data_cfg["train_split_name"]].drop(columns=[split_col])
+    test_df = df[df[split_col] == data_cfg["test_split_name"]].drop(columns=[split_col])
 
     if data_cfg["num_patients_train"] is not None:
-        pids = train_df["patient_id"].unique()
-        train_df = train_df[train_df["patient_id"].isin(pids[: data_cfg["num_patients_train"]])]
+        pids = train_df[pid_col].unique()
+        train_df = train_df[train_df[pid_col].isin(pids[: data_cfg["num_patients_train"]])]
 
-    feature_cols = train_df.drop(columns=["label", "patient_id"]).columns
-    mean = train_df[feature_cols].mean()
-    std = train_df[feature_cols].std().replace(0, 1)  # avoid division by zero
+    non_feature = [label_col, pid_col] + [c for c in avail_cols if c in train_df.columns]
+    feature_cols = [c for c in train_df.columns if c not in non_feature]
 
-    train_df[feature_cols] = (train_df[feature_cols] - mean) / std
-    test_df[feature_cols] = (test_df[feature_cols] - mean) / std
+    # Drop constant features
+    stds = train_df[feature_cols].std()
+    constant = stds[stds == 0].index.tolist()
+    if constant:
+        feature_cols = [c for c in feature_cols if c not in constant]
+        train_df.drop(columns=constant, inplace=True)
+        test_df.drop(columns=constant, inplace=True)
 
-    def split_to_tensors(df):
-        feats = torch.tensor(df.drop(columns=["label", "patient_id"]).to_numpy(), dtype=torch.float32)
-        labels = torch.tensor(df["label"].to_numpy(), dtype=torch.long)
-        pids = torch.tensor(df["patient_id"].to_numpy(), dtype=torch.long)
+    # Fill NaN
+    train_df[feature_cols] = train_df[feature_cols].fillna(0)
+    test_df[feature_cols] = test_df[feature_cols].fillna(0)
+
+    # Normalisation
+    if data_cfg.get("per_patient_normalization", False):
+        train_df = _per_patient_normalize(train_df, feature_cols, pid_col, label_col)
+        test_df = _per_patient_normalize(test_df, feature_cols, pid_col, label_col)
+        train_df[feature_cols] = train_df[feature_cols].fillna(0)
+        test_df[feature_cols] = test_df[feature_cols].fillna(0)
+    else:
+        mean = train_df[feature_cols].mean()
+        std = train_df[feature_cols].std().replace(0, 1)
+        train_df[feature_cols] = (train_df[feature_cols] - mean) / std
+        test_df[feature_cols] = (test_df[feature_cols] - mean) / std
+
+    def split_to_tensors(split_df):
+        feats = torch.tensor(split_df[feature_cols].to_numpy(), dtype=torch.float32)
+        labels = torch.tensor(split_df[label_col].to_numpy(), dtype=torch.long)
+        pids = torch.tensor(_encode_patient_ids(split_df[pid_col]), dtype=torch.long)
         return feats, labels, pids
 
     return (*split_to_tensors(train_df), *split_to_tensors(test_df))
@@ -602,20 +647,22 @@ def main():
         device = torch.device("cpu")
     logging.info(f"Using device: {device}")
 
+    # --- Load data ---
+    logging.info("Loading data...")
+    train_feats, train_labels, train_pids, test_feats, test_labels, test_pids = load_data(config)
+
     # --- Build and load model ---
     model_cfg = config["model_config"]
+    # Auto-detect input_dim from loaded data if not saved in config
+    input_dim = model_cfg.get("input_dim") or train_feats.shape[1]
     model = DeepResidualEmbeddingModel(
-        input_dim=model_cfg["input_dim"],
+        input_dim=input_dim,
         embedding_dim=model_cfg["embedding_dim"],
         num_blocks=model_cfg.get("num_residual_blocks", 3),
     ).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
-    logging.info(f"Loaded model from {model_path}")
-
-    # --- Load data ---
-    logging.info("Loading data...")
-    train_feats, train_labels, train_pids, test_feats, test_labels, test_pids = load_data(config)
+    logging.info(f"Loaded model from {model_path} (input_dim={input_dim})")
 
     # --- Extract embeddings ---
     logging.info("Extracting embeddings...")

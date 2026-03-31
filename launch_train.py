@@ -67,41 +67,106 @@ def save_config_to_json(results_dir):
 # DATA LOADING
 # ============================================================================
 
+def _encode_patient_ids(series):
+    """Map patient IDs (possibly strings like '01-001') to integer codes."""
+    codes, _ = pd.factorize(series)
+    return codes
+
+
+def _per_patient_normalize(df, feature_cols, pid_col, label_col):
+    """Z-score each feature relative to the patient's non-seizure baseline.
+    Falls back to the patient's overall stats if no non-seizure data exists."""
+    df = df.copy()
+    for pid, grp in df.groupby(pid_col):
+        baseline = grp[grp[label_col] == 0]
+        if len(baseline) < 2:
+            baseline = grp  # fallback
+        pmean = baseline[feature_cols].mean()
+        pstd = baseline[feature_cols].std().replace(0, 1)
+        df.loc[grp.index, feature_cols] = (grp[feature_cols] - pmean) / pstd
+    return df
+
+
 def load_train_test_dataset(csv_path, loss_type='batch_hard_triplet'):
-    """Load and preprocess the cardiac features dataset."""
+    """Load and preprocess features dataset (supports TUH and Teppe formats)."""
     logging.info(f"Loading dataset from {csv_path}")
     logging.info(f"Using loss type: {loss_type}")
     df = pd.read_csv(csv_path)
 
-    df.drop(columns=DATA_CONFIG['drop_columns'], inplace=True)
+    # Read column names from config
+    pid_col = DATA_CONFIG['patient_id_col']
+    label_col = DATA_CONFIG['label_col']
+    split_col = DATA_CONFIG['split_col']
+    drop_cols = [c for c in DATA_CONFIG['drop_columns'] if c in df.columns]
+    avail_cols = [c for c in DATA_CONFIG.get('availability_cols', []) if c in df.columns]
 
-    train_df = df[df['split'] == DATA_CONFIG['train_split_name']].drop(columns=['split'])
-    test_df = df[df['split'] == DATA_CONFIG['test_split_name']].drop(columns=['split'])
+    df.drop(columns=drop_cols, inplace=True)
+
+    # Split
+    train_df = df[df[split_col] == DATA_CONFIG['train_split_name']].drop(columns=[split_col])
+    test_df = df[df[split_col] == DATA_CONFIG['test_split_name']].drop(columns=[split_col])
 
     if DATA_CONFIG['num_patients_train'] is not None:
-        patient_ids_list = train_df['patient_id'].unique()
-        train_df = train_df[train_df['patient_id'].isin(
+        patient_ids_list = train_df[pid_col].unique()
+        train_df = train_df[train_df[pid_col].isin(
             patient_ids_list[:DATA_CONFIG['num_patients_train']]
         )]
 
     logging.info(f"Train samples: {len(train_df)}, Test samples: {len(test_df)}")
-    logging.info(f"Train label distribution:\n{train_df['label'].value_counts()}")
-    logging.info(f"Test label distribution:\n{test_df['label'].value_counts()}")
+    logging.info(f"Train label distribution:\n{train_df[label_col].value_counts()}")
+    logging.info(f"Test label distribution:\n{test_df[label_col].value_counts()}")
 
-    feature_columns = train_df.drop(columns=['label', 'patient_id']).columns
-    train_mean = train_df[feature_columns].mean()
-    train_std = train_df[feature_columns].std().replace(0, 1)
+    # Identify feature columns (everything except label, patient_id, and availability flags)
+    non_feature = [label_col, pid_col] + avail_cols
+    feature_columns = [c for c in train_df.columns if c not in non_feature]
 
-    train_df[feature_columns] = (train_df[feature_columns] - train_mean) / train_std
-    test_df[feature_columns] = (test_df[feature_columns] - train_mean) / train_std
+    # Drop constant features
+    stds = train_df[feature_columns].std()
+    constant = stds[stds == 0].index.tolist()
+    if constant:
+        logging.info(f"Dropping {len(constant)} constant features: {constant}")
+        feature_columns = [c for c in feature_columns if c not in constant]
+        train_df.drop(columns=constant, inplace=True)
+        test_df.drop(columns=constant, inplace=True)
 
-    train_features = torch.tensor(train_df.drop(columns=['label', 'patient_id']).to_numpy(), dtype=torch.float32)
-    train_labels = torch.tensor(train_df['label'].to_numpy(), dtype=torch.long)
-    train_patient_ids = torch.tensor(train_df['patient_id'].to_numpy(), dtype=torch.long)
+    # Fill NaN with 0 (for rows where a sensor was unavailable)
+    train_df[feature_columns] = train_df[feature_columns].fillna(0)
+    test_df[feature_columns] = test_df[feature_columns].fillna(0)
 
-    test_features = torch.tensor(test_df.drop(columns=['label', 'patient_id']).to_numpy(), dtype=torch.float32)
-    test_labels = torch.tensor(test_df['label'].to_numpy(), dtype=torch.long)
-    test_patient_ids = torch.tensor(test_df['patient_id'].to_numpy(), dtype=torch.long)
+    # Normalisation
+    if DATA_CONFIG.get('per_patient_normalization', False):
+        logging.info("Applying per-patient normalisation (baseline z-score)...")
+        train_df = _per_patient_normalize(train_df, feature_columns, pid_col, label_col)
+        test_df = _per_patient_normalize(test_df, feature_columns, pid_col, label_col)
+        # Fill any NaN introduced by patients with constant features
+        train_df[feature_columns] = train_df[feature_columns].fillna(0)
+        test_df[feature_columns] = test_df[feature_columns].fillna(0)
+    else:
+        # Global z-score normalisation
+        train_mean = train_df[feature_columns].mean()
+        train_std = train_df[feature_columns].std().replace(0, 1)
+        train_df[feature_columns] = (train_df[feature_columns] - train_mean) / train_std
+        test_df[feature_columns] = (test_df[feature_columns] - train_mean) / train_std
+
+    n_features = len(feature_columns)
+    logging.info(f"Using {n_features} features")
+
+    # Auto-detect input_dim
+    if MODEL_CONFIG['input_dim'] is None:
+        MODEL_CONFIG['input_dim'] = n_features
+        logging.info(f"Auto-detected input_dim = {n_features}")
+
+    # Convert to tensors — encode patient IDs to integers
+    train_pid_codes = _encode_patient_ids(train_df[pid_col])
+    test_pid_codes = _encode_patient_ids(test_df[pid_col])
+
+    train_features = torch.tensor(train_df[feature_columns].to_numpy(), dtype=torch.float32)
+    train_labels = torch.tensor(train_df[label_col].to_numpy(), dtype=torch.long)
+    train_patient_ids = torch.tensor(train_pid_codes, dtype=torch.long)
+
+    test_features = torch.tensor(test_df[feature_columns].to_numpy(), dtype=torch.float32)
+    test_labels = torch.tensor(test_df[label_col].to_numpy(), dtype=torch.long)
+    test_patient_ids = torch.tensor(test_pid_codes, dtype=torch.long)
 
     if loss_type == 'contrastive':
         train_dataset = ContrastiveDataset(
@@ -123,8 +188,8 @@ def load_train_test_dataset(csv_path, loss_type='batch_hard_triplet'):
         train_dataset = EmbeddingDataset(train_features, train_labels, train_patient_ids)
         test_dataset = EmbeddingDataset(test_features, test_labels, test_patient_ids)
 
-    patient_counts = train_df['patient_id'].value_counts()
-    weights = train_df['patient_id'].apply(lambda x: 1.0 / patient_counts[x]).values
+    patient_counts = pd.Series(train_pid_codes).value_counts()
+    weights = pd.Series(train_pid_codes).apply(lambda x: 1.0 / patient_counts[x]).values
 
     return train_dataset, test_dataset, weights
 
@@ -301,11 +366,9 @@ def main():
     os.makedirs(results_dir, exist_ok=True)
     logging.info(f"Results will be saved to: {results_dir}\n")
 
-    save_config_to_json(results_dir)
-
     loss_type = EMBEDDING_TRAINING_CONFIG['loss_type']
 
-    # Dataset for embedding training
+    # Dataset for embedding training (also auto-detects input_dim)
     train_dataset_embedding, _, weights = load_train_test_dataset(
         csv_path=DATA_CONFIG['data_path'],
         loss_type=loss_type,
@@ -316,6 +379,9 @@ def main():
         csv_path=DATA_CONFIG['data_path'],
         loss_type='simple',
     )
+
+    # Save config AFTER input_dim has been auto-detected
+    save_config_to_json(results_dir)
 
     # Dataloader for embedding training
     if loss_type == 'supcon':
