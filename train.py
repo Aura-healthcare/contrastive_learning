@@ -4,7 +4,7 @@ import logging
 from tqdm import tqdm
 import numpy as np
 import random
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score, confusion_matrix
+from sklearn.metrics import accuracy_score
 
 def train_model(model, train_dataloader, optimizer, loss_fn, device, epochs, scheduler, checkpoint_dir):
     model.train()
@@ -27,8 +27,8 @@ def train_model(model, train_dataloader, optimizer, loss_fn, device, epochs, sch
             optimizer.step()
             loss_list.append(epoch_loss / len(train_dataloader))
         logging.info(f"Epoch {epoch+1}/{epochs} loss: {epoch_loss/len(train_dataloader)}")
-        scheduler.step()
-        # if epoch % 5 == 0:
+        if scheduler is not None:
+            scheduler.step()
         torch.save(model.state_dict(), f'{checkpoint_dir}/model_{epoch}.pth')
 
     return model, loss_list
@@ -95,6 +95,34 @@ def train_model_triplet_hard_negative(model, train_dataloader, optimizer, loss_f
         torch.save(model.state_dict(), f'{checkpoint_dir}/model_{epoch}.pth')
 
     return model, loss_list
+
+
+def train_model_supcon(model, train_dataloader, optimizer, loss_fn, device, epochs, scheduler, checkpoint_dir):
+    """Training loop for SupervisedContrastiveLoss.
+    Passes seizure labels (not patient_ids) so positives are seizure↔seizure
+    and negatives are seizure↔non-seizure, across any patient.
+    """
+    model.train()
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        num_batches = 0
+        for batch in tqdm(train_dataloader):
+            features, labels, _ = batch
+            features, labels = features.to(device), labels.to(device)
+            optimizer.zero_grad()
+            loss = loss_fn(model(features), labels)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            num_batches += 1
+
+        avg_loss = epoch_loss / num_batches
+        logging.info(f"Epoch {epoch+1}/{epochs} loss: {avg_loss:.4f}")
+        if scheduler is not None:
+            scheduler.step()
+        torch.save(model.state_dict(), f'{checkpoint_dir}/model_{epoch}.pth')
+
+    return model, []
 
 
 def compute_distances(model, dataloader, device='cpu', k=10):
@@ -166,52 +194,4 @@ def train_classifier(classifier, train_dataloader, optimizer, criterion, device,
     return classifier, train_history
 
 
-def evaluate_classifier(classifier, dataloader, device):
-    """Evaluate the classifier and return comprehensive metrics."""
-    classifier.eval()
-    all_preds = []
-    all_labels = []
-    all_probs = []
-
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            features, labels, _ = batch
-            features, labels = features.to(device), labels.to(device)
-
-            logits = classifier(features)
-            probs = torch.softmax(logits, dim=1)
-
-            preds = torch.argmax(logits, dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs[:, 1].cpu().numpy())  # Probability of positive class
-
-    # Compute metrics
-    accuracy = accuracy_score(all_labels, all_preds)
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        all_labels, all_preds, average='binary', zero_division=0
-    )
-
-    # Compute ROC-AUC if both classes are present
-    try:
-        roc_auc = roc_auc_score(all_labels, all_probs)
-    except ValueError:
-        roc_auc = None
-        logging.warning("ROC-AUC could not be computed (only one class present)")
-
-    # Confusion matrix
-    cm = confusion_matrix(all_labels, all_preds)
-
-    metrics = {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'roc_auc': roc_auc,
-        'confusion_matrix': cm,
-        'predictions_probs': np.array(all_probs),
-        'true_labels': np.array(all_labels)
-    }
-
-    return metrics
 

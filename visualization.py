@@ -18,7 +18,7 @@ import random
 import os
 import time
 
-def visualize_umap(encoded_data, labels, patient_ids, results_dir):
+def visualize_umap(encoded_data, labels, patient_ids, results_dir, prefix='umap'):
     # Ensure results directory exists
     os.makedirs(results_dir, exist_ok=True)
 
@@ -28,11 +28,11 @@ def visualize_umap(encoded_data, labels, patient_ids, results_dir):
 
     print("Creating UMAP plots...")
     umap.plot.points(mapper, labels=patient_ids)
-    plt.savefig(os.path.join(results_dir, 'umap_plot_patient_ids.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(results_dir, f'{prefix}_patient_ids.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
     umap.plot.points(mapper, labels=labels)
-    plt.savefig(os.path.join(results_dir, 'umap_plot_labels.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(results_dir, f'{prefix}_labels.png'), dpi=300, bbox_inches='tight')
     plt.close()
     print("UMAP plots saved!")
 

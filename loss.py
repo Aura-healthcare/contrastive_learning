@@ -4,18 +4,16 @@ import torch
 
 # The ideal distance metric for a positive sample is set to 1, for a negative sample it is set to 0      
 class ContrastiveLoss(nn.Module):
-    def __init__(self, temperature=0.1):
-        super(ContrastiveLoss, self).__init__()
-        self.similarity = nn.CosineSimilarity(dim=-1, eps=1e-7)
-        self.temperature = temperature
+    def __init__(self):
+        super().__init__()
+        self.similarity = nn.CosineSimilarity(dim=-1)
 
-    def forward(self, anchor, contrastive, distance):
-        # use cosine similarity from torch to get score
+    def forward(self, anchor, contrastive, label):
+        # label: 1 for positive pair, 0 for negative pair
+        # map to {-1, +1} to match cosine similarity range
+        target = 2 * label - 1
         score = self.similarity(anchor, contrastive)
-        # Apply temperature scaling to make the loss more sensitive
-        score = score / self.temperature
-        # after cosine apply MSE between distance and score
-        return nn.MSELoss()(score, distance) #Ensures that the calculated score is close to the ideal distance (1 or 0)
+        return ((score - target) ** 2).mean()
 
 class TripletLoss(nn.Module):
     def __init__(self, margin=1.0):
@@ -27,6 +25,54 @@ class TripletLoss(nn.Module):
         neg_dist = F.pairwise_distance(anchor, negative, p=2)
         loss = F.relu(pos_dist - neg_dist + self.margin)
         return loss.mean()
+
+class SupervisedContrastiveLoss(nn.Module):
+    """
+    Supervised Contrastive Loss (Khosla et al. 2020).
+
+    For each anchor, ALL samples sharing the same label are treated as positives
+    (across any patient). All samples with a different label are negatives.
+
+    Loss per anchor i:
+        L_i = -1/|P(i)| * sum_{p in P(i)} log(
+                exp(sim(i,p) / τ) / sum_{a ≠ i} exp(sim(i,a) / τ)
+              )
+
+    Embeddings are L2-normalised internally so only their direction matters.
+    """
+
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, embeddings, labels):
+        """
+        embeddings : (B, D)
+        labels     : (B,)  — seizure/non-seizure class labels
+        """
+        device = embeddings.device
+        B = embeddings.size(0)
+
+        emb = F.normalize(embeddings, p=2, dim=1)          # (B, D)
+        sim = torch.matmul(emb, emb.T) / self.temperature  # (B, B)
+
+        self_mask = torch.eye(B, dtype=torch.bool, device=device)
+        pos_mask  = (labels.unsqueeze(1) == labels.unsqueeze(0)) & ~self_mask
+
+        # Numerical stability: subtract row max before exp
+        sim = sim - sim.max(dim=1, keepdim=True).values.detach()
+
+        exp_sim  = torch.exp(sim) * ~self_mask              # exclude self from denominator
+        log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+
+        n_pos = pos_mask.sum(dim=1).float()
+        valid = n_pos > 0
+        if not valid.any():
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        loss = -(log_prob * pos_mask).sum(dim=1) / (n_pos + 1e-8)
+        return loss[valid].mean()
+
 
 class BatchHardTripletLoss(nn.Module):
     def __init__(self, margin=1.0):

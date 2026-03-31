@@ -162,33 +162,29 @@ class ResidualBlock(nn.Module):
 
 
 class SeizureClassifier(nn.Module):
-    """Classification head that uses frozen embeddings from embedding model."""
-    def __init__(self, embedding_model, embedding_dim, num_classes=2):
+    """Classification head that uses embeddings from embedding model."""
+    def __init__(self, embedding_model, embedding_dim, num_classes=2, hidden_dims=None):
         super(SeizureClassifier, self).__init__()
         self.embedding_model = embedding_model
 
-        # Freeze the embedding model
+        # Freeze the embedding model by default
         for param in self.embedding_model.parameters():
             param.requires_grad = False
 
         # Classification head
-        self.classifier = nn.Sequential(
-            nn.Linear(embedding_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, num_classes)
-        )
+        if hidden_dims is None:
+            hidden_dims = [64, 32]
+        layers = []
+        in_dim = embedding_dim
+        for h in hidden_dims:
+            layers += [nn.Linear(in_dim, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(0.3)]
+            in_dim = h
+        layers.append(nn.Linear(in_dim, num_classes))
+        self.classifier = nn.Sequential(*layers)
 
     def forward(self, x):
-        with torch.no_grad():
-            embeddings = self.embedding_model(x)
-        logits = self.classifier(embeddings)
-        return logits
+        embeddings = self.embedding_model(x)
+        return self.classifier(embeddings)
 
     def unfreeze_embedding_model(self, last_n_blocks=None):
         """Unfreeze embedding model for fine-tuning.

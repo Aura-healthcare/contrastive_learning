@@ -13,7 +13,7 @@ DATA_CONFIG = {
     'results_dir': None,  # Will be auto-generated with timestamp if None
 
     # Data preprocessing
-    'num_patients_train': 10,  # Limit training to N patients for quick experiments (None for all)
+    'num_patients_train': None,  # Limit training to N patients for quick experiments (None for all)
     'use_weighted_sampling': True,  # Use weighted sampling to balance across patients
 
     # Features to drop
@@ -32,14 +32,14 @@ DATA_CONFIG = {
 MODEL_CONFIG = {
     # Input/output dimensions
     'input_dim': 14,
-    'embedding_dim': 1024,
+    'embedding_dim': 128,
     'num_classes': 2,
 
     # Embedding model architecture
     'num_residual_blocks': 3,  # Number of residual blocks in each stage
 
     # Classifier architecture
-    'classifier_hidden_dims': [256, 64],  # Hidden layer sizes in classifier head
+    'classifier_hidden_dims': [64, 32],  # Hidden layer sizes in classifier head
     'classifier_dropout': 0.3,
 }
 
@@ -49,22 +49,24 @@ MODEL_CONFIG = {
 # ============================================================================
 
 EMBEDDING_TRAINING_CONFIG = {
-    'epochs': 10,
+    'epochs': 30,
     'batch_size': 1024,
     'learning_rate': 5e-3,
 
-    # Loss function options: 'contrastive', 'triplet', 'batch_hard_triplet'
-    'loss_type': 'batch_hard_triplet',
+    # Loss function options: 'contrastive', 'triplet', 'batch_hard_triplet', 'supcon'
+    'loss_type': 'supcon',
 
     # Loss function parameters
     'margin': 1.0,              # For triplet and batch_hard_triplet
-    'temperature': 0.1,         # For contrastive loss
+    'temperature': 0.3,         # For contrastive loss
     'num_pairs': 5000,          # For contrastive dataset
+    'pk_p': 8,                  # PKBatchSampler: number of patients per batch (supcon)
+    'pk_k': 16,                 # PKBatchSampler: number of samples per patient per batch (supcon)
 
     # Learning rate scheduler
     'use_scheduler': True,
-    'scheduler_step_size': 7,
-    'scheduler_gamma': 0.3,
+    'scheduler_step_size': 10,
+    'scheduler_gamma': 0.5,
 
     # Checkpointing
     'save_checkpoints': True,
