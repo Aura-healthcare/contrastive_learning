@@ -32,7 +32,7 @@ from sklearn.metrics import (
     roc_auc_score,
     confusion_matrix,
 )
-from sklearn.neighbors import KNeighborsClassifier
+import faiss
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -153,12 +153,42 @@ def extract_embeddings(model, features, labels, pids, device, batch_size=512):
 # kNN CLASSIFIER
 # ============================================================================
 
+def _eval_knn_faiss(train_embs, train_labels, test_embs, test_labels, k=5, nprobe=32):
+    """Fast approximate kNN using FAISS IVF index (cosine on L2-normed vectors)."""
+    # L2-normalize so inner product == cosine similarity
+    train_normed = train_embs / (np.linalg.norm(train_embs, axis=1, keepdims=True) + 1e-8)
+    test_normed = test_embs / (np.linalg.norm(test_embs, axis=1, keepdims=True) + 1e-8)
+
+    train_normed = np.ascontiguousarray(train_normed.astype(np.float32))
+    test_normed = np.ascontiguousarray(test_normed.astype(np.float32))
+
+    d = train_normed.shape[1]
+    n_train = train_normed.shape[0]
+    nlist = int(np.sqrt(n_train))
+
+    quantizer = faiss.IndexFlatIP(d)
+    index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+    index.train(train_normed)
+    index.add(train_normed)
+    index.nprobe = nprobe
+    logging.info(f"FAISS IVF index: nlist={nlist}, nprobe={nprobe}")
+
+    distances, indices = index.search(test_normed, k)
+
+    # Majority vote
+    neighbor_labels = train_labels[indices]  # (n_test, k)
+    preds = np.array([np.bincount(row.astype(int), minlength=2).argmax() for row in neighbor_labels])
+
+    # Probability estimate (fraction of positive neighbors)
+    probs = neighbor_labels.astype(float).mean(axis=1)
+
+    return preds, probs
+
+
 def eval_knn(train_embs, train_labels, test_embs, test_labels, k=5):
-    """kNN: use train embeddings as gallery, classify test queries by majority vote."""
-    knn = KNeighborsClassifier(n_neighbors=k, metric="cosine", n_jobs=-1)
-    knn.fit(train_embs, train_labels)
-    preds = knn.predict(test_embs)
-    probs = knn.predict_proba(test_embs)[:, 1]
+    """kNN: use train embeddings as gallery, classify test queries by majority vote.
+    Uses FAISS IVF index for fast approximate cosine search."""
+    preds, probs = _eval_knn_faiss(train_embs, train_labels, test_embs, test_labels, k)
 
     precision, recall, f1, _ = precision_recall_fscore_support(
         test_labels, preds, average="binary", zero_division=0
@@ -277,22 +307,53 @@ def eval_retrieval(query_embs, query_labels, gallery_embs, gallery_labels, k_val
     For each query (test sample), rank the gallery (train samples) by cosine similarity.
     A gallery item is "relevant" if it shares the same label as the query.
 
-    Computes: Precision@K, Recall@K, mAP.
+    Uses FAISS for top-K retrieval to avoid building the full similarity matrix.
+
+    Metrics (computed per query, then averaged):
+      - Precision@K: fraction of the top-K retrieved items that share the query's label.
+        E.g. P@5=0.8 means 4 out of 5 nearest neighbors have the same label.
+      - Recall@K: fraction of ALL same-label items in the gallery that appear in the top-K.
+        E.g. if there are 1000 seizure items in the gallery and 3 appear in top-20, R@20=0.003.
+      - mAP@K: average precision over the ranked top-K list — rewards relevant items
+        appearing earlier in the ranking.
     """
-    # L2-normalize for dot-product cosine similarity
+    max_k = max(k_values)
+
+    logging.info(f"Retrieval: normalizing {len(query_embs)} queries and {len(gallery_embs)} gallery vectors...")
     q_norm = query_embs / (np.linalg.norm(query_embs, axis=1, keepdims=True) + 1e-8)
     g_norm = gallery_embs / (np.linalg.norm(gallery_embs, axis=1, keepdims=True) + 1e-8)
 
-    sim_matrix = q_norm @ g_norm.T  # (N_query, N_gallery)
+    q_norm = np.ascontiguousarray(q_norm.astype(np.float32))
+    g_norm = np.ascontiguousarray(g_norm.astype(np.float32))
+
+    d = g_norm.shape[1]
+
+    n_gallery = len(g_norm)
+    nlist = int(np.sqrt(n_gallery))
+    nprobe = 32
+    logging.info(f"Retrieval: building FAISS IVF index (dim={d}, gallery={n_gallery}, nlist={nlist}, nprobe={nprobe})...")
+    quantizer = faiss.IndexFlatIP(d)
+    index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+    index.train(g_norm)
+    index.add(g_norm)
+    index.nprobe = nprobe
+    logging.info(f"Retrieval: searching top-{max_k} for {len(q_norm)} queries...")
+    _, indices = index.search(q_norm, max_k)
+    logging.info("Retrieval: FAISS search done, computing metrics...")
+
+    # Pre-count relevant items per query label for recall
+    label_counts = {}
+    for lbl in np.unique(query_labels):
+        label_counts[lbl] = int((gallery_labels == lbl).sum())
 
     prec_at_k = {k: [] for k in k_values}
     rec_at_k = {k: [] for k in k_values}
     ap_list = []
 
     for i in range(len(query_labels)):
-        sorted_idx = np.argsort(-sim_matrix[i])
-        relevance = (gallery_labels[sorted_idx] == query_labels[i]).astype(float)
-        n_relevant = relevance.sum()
+        top_k_labels = gallery_labels[indices[i]]
+        relevance = (top_k_labels == query_labels[i]).astype(float)
+        n_relevant = label_counts.get(query_labels[i], 0)
 
         if n_relevant == 0:
             continue
@@ -302,9 +363,9 @@ def eval_retrieval(query_embs, query_labels, gallery_embs, gallery_labels, k_val
             prec_at_k[k].append(top_k.mean())
             rec_at_k[k].append(top_k.sum() / n_relevant)
 
-        # Average Precision
+        # Average Precision (truncated at max_k)
         cumsum = np.cumsum(relevance)
-        ranks = np.arange(1, len(relevance) + 1)
+        ranks = np.arange(1, max_k + 1)
         ap = ((cumsum / ranks) * relevance).sum() / n_relevant
         ap_list.append(ap)
 
@@ -386,9 +447,8 @@ def eval_classifier_head(classifier, train_dataloader, test_dataloader, device, 
 # UMAP VISUALIZATION
 # ============================================================================
 
-def generate_umap_visualizations(embedding_model, dataloader, device, results_dir, sample_size=None, prefix='umap'):
-    """Generate UMAP plots of the embedding space, colored by label and by patient."""
-    logging.info(f"Generating UMAP visualizations ({prefix})...")
+def _extract_from_dataloader(embedding_model, dataloader, device, sample_size=None):
+    """Extract embeddings, labels, patient_ids from a dataloader."""
     embedding_model.eval()
     encoded_data, labels, patient_ids = [], [], []
 
@@ -414,10 +474,41 @@ def generate_umap_visualizations(embedding_model, dataloader, device, results_di
     patient_ids = np.array(patient_ids)
 
     if sample_size is not None and len(encoded_data) > sample_size:
-        idx = np.random.choice(len(encoded_data), sample_size, replace=False)
+        # Keep all seizure samples (up to sample_size), fill the rest with no-seizure.
+        # Cap seizure at 10% of sample_size to avoid distorting UMAP neighborhoods.
+        minority_idx = np.where(labels == 1)[0]
+        majority_idx = np.where(labels != 1)[0]
+
+        max_minority = min(len(minority_idx), sample_size // 10)
+        if len(minority_idx) > max_minority:
+            minority_idx = np.random.choice(minority_idx, max_minority, replace=False)
+
+        n_majority = sample_size - len(minority_idx)
+        if n_majority < len(majority_idx):
+            majority_idx = np.random.choice(majority_idx, n_majority, replace=False)
+
+        idx = np.concatenate([minority_idx, majority_idx])
+        np.random.shuffle(idx)
         encoded_data, labels, patient_ids = encoded_data[idx], labels[idx], patient_ids[idx]
 
-    visualize_umap(encoded_data, labels, patient_ids, results_dir, prefix=prefix)
+    return encoded_data, labels, patient_ids
+
+
+def generate_umap_visualizations(embedding_model, dataloader, device, results_dir,
+                                 sample_size=None, prefix='umap', test_dataloader=None):
+    """Generate UMAP plots. UMAP is fit on train data; test is projected into the same space."""
+    logging.info(f"Generating UMAP visualizations ({prefix})...")
+
+    encoded_data, labels, patient_ids = _extract_from_dataloader(
+        embedding_model, dataloader, device, sample_size)
+
+    test_data, test_labels, test_pids = None, None, None
+    if test_dataloader is not None:
+        test_data, test_labels, test_pids = _extract_from_dataloader(
+            embedding_model, test_dataloader, device, sample_size)
+
+    visualize_umap(encoded_data, labels, patient_ids, results_dir, prefix=prefix,
+                   test_data=test_data, test_labels=test_labels, test_patient_ids=test_pids)
     logging.info("UMAP visualizations completed!\n")
 
 
@@ -524,22 +615,33 @@ def generate_report(results_dir):
 
     # --- Images ---
     umap_html = ""
-    if any(os.path.exists(os.path.join(results_dir, f)) for f in (
-        "umap_pretrain_labels.png", "umap_pretrain_patient_ids.png"
-    )):
-        umap_html += "<h3>Pre-fine-tune (Phase 1)</h3>"
-        umap_html += img_row(
-            ("umap_pretrain_labels.png", "by label"),
-            ("umap_pretrain_patient_ids.png", "by patient"),
-        )
-    if any(os.path.exists(os.path.join(results_dir, f)) for f in (
-        "umap_finetuned_labels.png", "umap_finetuned_patient_ids.png"
-    )):
-        umap_html += "<h3>Fine-tuned (Phase 2)</h3>"
-        umap_html += img_row(
-            ("umap_finetuned_labels.png", "by label"),
-            ("umap_finetuned_patient_ids.png", "by patient"),
-        )
+    # Determine which model eval.py used
+    finetuned_exists = os.path.exists(os.path.join(results_dir, "embedding_model_finetuned.pth"))
+    eval_model_label = "fine-tuned embedding" if finetuned_exists else "Phase 1 embedding (no fine-tuning)"
+
+    for phase_prefix, phase_title in [
+        ("umap_pretrain", "Pre-fine-tune (Phase 1 embedding)"),
+        ("umap_finetuned", "Post-fine-tune (Phase 2 — unfrozen embedding)"),
+        ("umap_eval", f"Eval ({eval_model_label})"),
+    ]:
+        train_exists = any(os.path.exists(os.path.join(results_dir, f)) for f in (
+            f"{phase_prefix}_labels.png", f"{phase_prefix}_patient_ids.png"
+        ))
+        test_exists = any(os.path.exists(os.path.join(results_dir, f)) for f in (
+            f"{phase_prefix}_test_labels.png", f"{phase_prefix}_test_patient_ids.png"
+        ))
+        if train_exists:
+            umap_html += f"<h3>{phase_title} — Train</h3>"
+            umap_html += img_row(
+                (f"{phase_prefix}_labels.png", "by label"),
+                (f"{phase_prefix}_patient_ids.png", "by patient"),
+            )
+        if test_exists:
+            umap_html += f"<h3>{phase_title} — Test (same UMAP space)</h3>"
+            umap_html += img_row(
+                (f"{phase_prefix}_test_labels.png", "by label"),
+                (f"{phase_prefix}_test_patient_ids.png", "by patient"),
+            )
     classifier_html = img_row(
         ("classifier_training_history.png", "Classifier training history"),
     ) + img_row(
@@ -659,6 +761,7 @@ def main():
         input_dim=input_dim,
         embedding_dim=model_cfg["embedding_dim"],
         num_blocks=model_cfg.get("num_residual_blocks", 3),
+        dropout=model_cfg.get("embedding_dropout", 0.2),
     ).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
@@ -718,16 +821,37 @@ def main():
         json.dump(all_results, f, indent=4)
     logging.info(f"\nMetrics saved to {out_path}")
 
-    # --- UMAP ---
-    if not args.no_umap:
-        logging.info(f"\n{'='*60}\nUMAP Visualizations\n{'='*60}")
-        embs_viz, labels_viz, pids_viz = test_embs, test_labels_np, test_pids_np
-        if args.umap_sample_size and len(embs_viz) > args.umap_sample_size:
-            idx = np.random.choice(len(embs_viz), args.umap_sample_size, replace=False)
-            embs_viz = embs_viz[idx]
-            labels_viz = labels_viz[idx]
-            pids_viz = pids_viz[idx]
-        visualize_umap(embs_viz, labels_viz, pids_viz, args.results_dir, prefix='umap_finetuned')
+    # --- UMAP (only if model differs from Phase 1, i.e. fine-tuned embedding exists) ---
+    finetuned_exists = os.path.exists(os.path.join(args.results_dir, "embedding_model_finetuned.pth"))
+    if not args.no_umap and finetuned_exists:
+        logging.info(f"\n{'='*60}\nUMAP Visualizations (fine-tuned embedding)\n{'='*60}")
+        sample = args.umap_sample_size
+
+        def _subsample_keep_minority(embs, labels, pids, n):
+            if n is None or len(embs) <= n:
+                return embs, labels, pids
+            minority_idx = np.where(labels == 1)[0]
+            majority_idx = np.where(labels != 1)[0]
+            max_minority = min(len(minority_idx), n // 10)
+            if len(minority_idx) > max_minority:
+                minority_idx = np.random.choice(minority_idx, max_minority, replace=False)
+            n_majority = n - len(minority_idx)
+            if n_majority < len(majority_idx):
+                majority_idx = np.random.choice(majority_idx, n_majority, replace=False)
+            idx = np.concatenate([minority_idx, majority_idx])
+            np.random.shuffle(idx)
+            return embs[idx], labels[idx], pids[idx]
+
+        train_viz, train_lbl_viz, train_pid_viz = _subsample_keep_minority(
+            train_embs, train_labels_np, train_pids_np, sample)
+        test_viz, test_lbl_viz, test_pid_viz = _subsample_keep_minority(
+            test_embs, test_labels_np, test_pids_np, sample)
+
+        visualize_umap(train_viz, train_lbl_viz, train_pid_viz, args.results_dir,
+                       prefix='umap_eval',
+                       test_data=test_viz, test_labels=test_lbl_viz, test_patient_ids=test_pid_viz)
+    elif not args.no_umap:
+        logging.info("Skipping eval UMAP — no fine-tuned embedding, same as Phase 1 pretrain UMAP")
 
     # --- HTML report ---
     generate_report(args.results_dir)

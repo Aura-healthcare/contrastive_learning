@@ -31,7 +31,7 @@ _TUH_DATA_CONFIG = {
 
 # --- Teppe format ---
 _TEPPE_DATA_CONFIG = {
-    'data_path': '/Users/laura/Documents/aura/teppe_dummy_multipatient.csv',
+    'data_path': '/home/adm-laura/git/feat-grid-all-intersect-clean.csv',
     'patient_id_col': 'patient-id',
     'label_col': 'label',
     'split_col': 'training-split',
@@ -65,6 +65,7 @@ MODEL_CONFIG = {
     'num_classes': 2,
 
     'num_residual_blocks': 2,  # Reduced from 3
+    'embedding_dropout': 0.4, # Increased from 0.2 to reduce overfitting on seizure samples
 
     'classifier_hidden_dims': [64, 32],
     'classifier_dropout': 0.3,
@@ -76,7 +77,7 @@ MODEL_CONFIG = {
 # ============================================================================
 
 EMBEDDING_TRAINING_CONFIG = {
-    'epochs': 5,  # Set low for testing (use 30+ for real training)
+    'epochs': 30,   # Reduced from 100 — fewer seizure samples get over-compressed with too many epochs
     'batch_size': 1024,
     'learning_rate': 1e-3,  # Reduced from 5e-3
 
@@ -87,8 +88,9 @@ EMBEDDING_TRAINING_CONFIG = {
     'margin': 1.0,              # For triplet and batch_hard_triplet
     'temperature': 0.07,        # Reduced from 0.3 — sharper focus on hard negatives
     'num_pairs': 5000,          # For contrastive dataset
-    'pk_p': 8,                  # PKBatchSampler: number of patients per batch (supcon)
+    'pk_p': 16,                 # PKBatchSampler: number of patients per batch (supcon)
     'pk_k': 16,                 # PKBatchSampler: number of samples per patient per batch (supcon)
+    'max_per_patient': 4,       # Cap per-patient samples per class per batch (forces cross-patient diversity)
 
     # Learning rate scheduler
     'use_scheduler': True,
@@ -138,7 +140,7 @@ EVAL_CONFIG = {
 # ============================================================================
 
 DEVICE_CONFIG = {
-    'use_cuda': True,  # Set to False to force CPU
+    'use_cuda': False,  # Set to False to force CPU
     'cuda_device': 0,  # GPU device number
 }
 

@@ -198,7 +198,7 @@ def load_train_test_dataset(csv_path, loss_type='batch_hard_triplet'):
 # EMBEDDING TRAINING
 # ============================================================================
 
-def train_embedding_model(train_dataloader, device, results_dir=None):
+def train_embedding_model(train_dataloader, device, results_dir=None, train_labels=None):
     """Train the embedding model using the loss type set in config."""
     loss_type = EMBEDDING_TRAINING_CONFIG['loss_type']
 
@@ -210,6 +210,7 @@ def train_embedding_model(train_dataloader, device, results_dir=None):
         input_dim=MODEL_CONFIG['input_dim'],
         embedding_dim=MODEL_CONFIG['embedding_dim'],
         num_blocks=MODEL_CONFIG['num_residual_blocks'],
+        dropout=MODEL_CONFIG.get('embedding_dropout', 0.2),
     ).to(device)
 
     if loss_type == 'contrastive':
@@ -217,7 +218,19 @@ def train_embedding_model(train_dataloader, device, results_dir=None):
     elif loss_type == 'triplet':
         loss_fn = TripletLoss(margin=EMBEDDING_TRAINING_CONFIG['margin'])
     elif loss_type == 'supcon':
-        loss_fn = SupervisedContrastiveLoss(temperature=EMBEDDING_TRAINING_CONFIG['temperature'])
+        # Compute inverse-frequency class weights so seizure anchors
+        # contribute equally to the loss despite ~800:1 imbalance
+        class_weights = None
+        if train_labels is not None:
+            labels_np = train_labels.numpy() if hasattr(train_labels, 'numpy') else train_labels
+            unique, counts = np.unique(labels_np, return_counts=True)
+            total = counts.sum()
+            class_weights = {int(c): total / (len(unique) * count) for c, count in zip(unique, counts)}
+            logging.info(f"SupCon class weights: {class_weights}")
+        loss_fn = SupervisedContrastiveLoss(
+            temperature=EMBEDDING_TRAINING_CONFIG['temperature'],
+            class_weights=class_weights,
+        )
     else:  # batch_hard_triplet
         loss_fn = BatchHardTripletLoss(margin=EMBEDDING_TRAINING_CONFIG['margin'])
 
@@ -392,6 +405,7 @@ def main():
             P=EMBEDDING_TRAINING_CONFIG['pk_p'],
             K=EMBEDDING_TRAINING_CONFIG['pk_k'],
             labels=train_dataset_embedding.labels,  # class-balanced batches for SupCon
+            max_per_patient=EMBEDDING_TRAINING_CONFIG.get('max_per_patient'),
         )
         train_dataloader_embedding = DataLoader(
             train_dataset_embedding,
@@ -427,18 +441,25 @@ def main():
         batch_size=128,
         shuffle=False,
     )
+    test_dataloader_umap = DataLoader(
+        test_dataset_classifier,
+        batch_size=128,
+        shuffle=False,
+    )
 
     # Phase 1: Train embedding model
     embedding_model = train_embedding_model(
-        train_dataloader_embedding, device, results_dir=results_dir
+        train_dataloader_embedding, device, results_dir=results_dir,
+        train_labels=train_dataset_embedding.labels,
     )
 
-    # UMAP
+    # UMAP (fit on train, project test into same space)
     if EVAL_CONFIG['generate_umap']:
         generate_umap_visualizations(
             embedding_model, train_dataloader_umap, device, results_dir,
             sample_size=EVAL_CONFIG['umap_sample_size'],
             prefix='umap_pretrain',
+            test_dataloader=test_dataloader_umap,
         )
 
     # Phase 2: Train classifier
@@ -449,6 +470,15 @@ def main():
         device,
         results_dir,
     )
+
+    # Post-finetuning UMAP (only when embeddings were unfrozen — otherwise identical to pretrain)
+    if EVAL_CONFIG['generate_umap'] and not CLASSIFIER_TRAINING_CONFIG['freeze_embeddings']:
+        generate_umap_visualizations(
+            classifier.embedding_model, train_dataloader_umap, device, results_dir,
+            sample_size=EVAL_CONFIG['umap_sample_size'],
+            prefix='umap_finetuned',
+            test_dataloader=test_dataloader_umap,
+        )
 
     # Evaluate classifier
     _, test_metrics = eval_classifier_head(

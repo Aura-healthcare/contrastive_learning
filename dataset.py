@@ -169,17 +169,24 @@ class PKBatchSampler(Sampler):
     same-label positives even when classes are heavily imbalanced (e.g. 5%
     seizure rate).
 
+    The max_per_patient parameter caps how many samples a single patient
+    contributes per class per batch. Lower values force more cross-patient
+    diversity, which prevents the model from learning patient identity as
+    a shortcut for same-label similarity.
+
     Usage (patient-only, for BatchHardTripletLoss):
         sampler = PKBatchSampler(dataset.patient_ids, P=8, K=8)
 
     Usage (class-balanced, recommended for SupCon):
-        sampler = PKBatchSampler(dataset.patient_ids, P=8, K=8, labels=dataset.labels)
+        sampler = PKBatchSampler(dataset.patient_ids, P=8, K=8, labels=dataset.labels,
+                                 max_per_patient=4)
         loader = DataLoader(dataset, batch_sampler=sampler)
     """
 
-    def __init__(self, patient_ids, P=8, K=8, labels=None):
+    def __init__(self, patient_ids, P=8, K=8, labels=None, max_per_patient=None):
         self.P = P
         self.K = K
+        self.max_per_patient = max_per_patient
 
         self.pid_to_indices = defaultdict(list)
         for idx, pid in enumerate(patient_ids):
@@ -219,7 +226,7 @@ class PKBatchSampler(Sampler):
                 batch = []
 
     def _class_balanced_iter(self):
-        """Yield batches with equal samples per class, maintaining patient diversity."""
+        """Yield batches with equal samples per class, maximizing cross-patient diversity."""
         classes = sorted(self.class_pid_indices.keys())
         n_cls = len(classes)
         per_class = (self.P * self.K) // n_cls
@@ -230,17 +237,31 @@ class PKBatchSampler(Sampler):
                 pid_dict = self.class_pid_indices[cls]
                 all_class_indices = [i for idxs in pid_dict.values() for i in idxs]
 
-                # Collect per_class samples with patient diversity
+                # Cap per-patient contribution to force cross-patient diversity
+                cap = self.max_per_patient if self.max_per_patient is not None else self.K
+
+                # Collect per_class samples, cycling through patients
                 pids = list(pid_dict.keys())
                 random.shuffle(pids)
                 collected = []
+
+                # First pass: draw up to `cap` samples from each patient
                 for pid in pids:
                     need = per_class - len(collected)
                     if need <= 0:
                         break
-                    collected.extend(self._draw(pid_dict[pid], min(self.K, need)))
+                    collected.extend(self._draw(pid_dict[pid], min(cap, need)))
 
-                # Fill remainder from full class pool if not enough diverse patients
+                # Second pass: if we still need more (few patients), cycle again
+                if len(collected) < per_class:
+                    random.shuffle(pids)
+                    for pid in pids:
+                        need = per_class - len(collected)
+                        if need <= 0:
+                            break
+                        collected.extend(self._draw(pid_dict[pid], min(cap, need)))
+
+                # Final fallback: fill from full class pool
                 if len(collected) < per_class:
                     collected.extend(random.choices(all_class_indices, k=per_class - len(collected)))
 

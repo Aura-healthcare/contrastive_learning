@@ -99,18 +99,20 @@ def train_model_triplet_hard_negative(model, train_dataloader, optimizer, loss_f
 
 def train_model_supcon(model, train_dataloader, optimizer, loss_fn, device, epochs, scheduler, checkpoint_dir):
     """Training loop for SupervisedContrastiveLoss.
-    Passes seizure labels (not patient_ids) so positives are seizure↔seizure
-    and negatives are seizure↔non-seizure, across any patient.
+    Passes seizure labels and patient_ids so that only cross-patient
+    same-label pairs are treated as positives.
     """
     model.train()
     for epoch in range(epochs):
         epoch_loss = 0.0
         num_batches = 0
         for batch in tqdm(train_dataloader):
-            features, labels, _ = batch
-            features, labels = features.to(device), labels.to(device)
+            features, labels, patient_ids = batch
+            features = features.to(device)
+            labels = labels.to(device)
+            patient_ids = patient_ids.to(device)
             optimizer.zero_grad()
-            loss = loss_fn(model(features), labels)
+            loss = loss_fn(model(features), labels, patient_ids=patient_ids)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()

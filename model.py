@@ -42,20 +42,20 @@ class EmbeddingModel(nn.Module):
 
 # Alternative: Deep Residual Network
 class DeepResidualEmbeddingModel(nn.Module):
-    def __init__(self, input_dim, embedding_dim, num_blocks=3):
+    def __init__(self, input_dim, embedding_dim, num_blocks=3, dropout=0.2):
         super(DeepResidualEmbeddingModel, self).__init__()
-        
+
         self.input_layer = nn.Sequential(
             nn.Linear(input_dim, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Dropout(0.2)
+            nn.Dropout(dropout)
         )
         
         # Residual blocks at 256
         self.residual_blocks_256 = nn.ModuleList()
         for i in range(num_blocks):
-            self.residual_blocks_256.append(ResidualBlock(256, 256))
+            self.residual_blocks_256.append(ResidualBlock(256, 256, dropout=dropout))
         
         # Expansion to 512 (if needed)
         if embedding_dim >= 512:
@@ -63,30 +63,30 @@ class DeepResidualEmbeddingModel(nn.Module):
                 nn.Linear(256, 512),
                 nn.BatchNorm1d(512),
                 nn.ReLU(),
-                nn.Dropout(0.2)
+                nn.Dropout(dropout)
             )
-            
+
             # Residual blocks at 512
             self.residual_blocks_512 = nn.ModuleList()
             for i in range(num_blocks):
-                self.residual_blocks_512.append(ResidualBlock(512, 512))
+                self.residual_blocks_512.append(ResidualBlock(512, 512, dropout=dropout))
         else:
             self.expand_to_512 = nn.Identity()
             self.residual_blocks_512 = nn.ModuleList()
-        
+
         # Expansion to 1024 (if needed)
         if embedding_dim >= 1024:
             self.expand_to_1024 = nn.Sequential(
                 nn.Linear(512, 1024),
                 nn.BatchNorm1d(1024),
                 nn.ReLU(),
-                nn.Dropout(0.2)
+                nn.Dropout(dropout)
             )
             
             # Residual blocks at 1024
             self.residual_blocks_1024 = nn.ModuleList()
             for i in range(num_blocks):
-                self.residual_blocks_1024.append(ResidualBlock(1024, 1024))
+                self.residual_blocks_1024.append(ResidualBlock(1024, 1024, dropout=dropout))
         else:
             self.expand_to_1024 = nn.Identity()
             self.residual_blocks_1024 = nn.ModuleList()
@@ -139,14 +139,14 @@ class DeepResidualEmbeddingModel(nn.Module):
         return embedding
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_dim, out_dim):
+    def __init__(self, in_dim, out_dim, dropout=0.2):
         super(ResidualBlock, self).__init__()
 
         self.layers = nn.Sequential(
             nn.Linear(in_dim, out_dim),
             nn.BatchNorm1d(out_dim),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(dropout),
             nn.Linear(out_dim, out_dim),
             nn.BatchNorm1d(out_dim)
         )
