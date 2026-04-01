@@ -88,7 +88,7 @@ def _per_patient_normalize(df, feature_cols, pid_col, label_col):
 
 
 def load_train_test_dataset(csv_path, loss_type='batch_hard_triplet'):
-    """Load and preprocess features dataset (supports TUH and Teppe formats)."""
+    """Load and preprocess features dataset."""
     logging.info(f"Loading dataset from {csv_path}")
     logging.info(f"Using loss type: {loss_type}")
     df = pd.read_csv(csv_path)

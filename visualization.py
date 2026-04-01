@@ -97,7 +97,7 @@ def visualize_embeddings(encoded_data, labels, results_dir):
 
     # Create layout
     layout = go.Layout(
-        title="TUH Dataset - Encoded and PCA Reduced 3D Scatter Plot",
+        title="Encoded and PCA Reduced 3D Scatter Plot",
         scene=dict(
             xaxis=dict(title="PC1"),
             yaxis=dict(title="PC2"),

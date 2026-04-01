@@ -11,8 +11,7 @@ Interesting paper on contrastive learning : https://arxiv.org/pdf/2010.05113
 
 Contrastive learning in ECG or EEG :  https://pubmed.ncbi.nlm.nih.gov/37028019/
 
-Work done on TUH dataset.
-You can see an example of the training run in [this folder](results_20260214_090530) (example work).
+Work done on Teppe dataset (29 HRV + 141 accelerometer features, 9 patients).
 
 ## Usage
 Install uv
@@ -71,7 +70,7 @@ Based on [Khosla et al. 2020](https://arxiv.org/abs/2004.11362). Extends contras
 
 | Role | How selected |
 |------|-------------|
-| **Positives** | All samples in the batch with the **same label** (seizure↔seizure, non-seizure↔non-seizure), across any patient |
+| **Positives** | All samples in the batch with the **same label AND different patient** — same-patient pairs are excluded to prevent learning patient identity as a shortcut |
 | **Negatives** | All samples in the batch with a **different label** |
 
 Loss per anchor `i` over a batch of B samples:
@@ -80,12 +79,12 @@ L_i = -1/|P(i)| · Σ_{p∈P(i)} log( exp(sim(i,p)/τ) / Σ_{a≠i} exp(sim(i,a)
 ```
 
 Key properties:
+- **Cross-patient positives only** — same-patient, same-label pairs are excluded from the positive set. This forces the model to find seizure features that are shared across patients rather than relying on within-patient similarity
+- **Class-weighted loss** — each anchor's loss is weighted by inverse class frequency, so seizure anchors contribute equally despite ~800:1 imbalance
 - Embeddings are **L2-normalised** — only direction matters, not magnitude
 - Temperature `τ` (default `0.07`) controls cluster tightness — lower = sharper boundaries
 - Unlike triplet losses, every positive in the batch contributes a gradient signal
-- Uses `EmbeddingDataset` + `PKBatchSampler` for patient-diverse batches — critical so that same-label positives come from different patients
-
-This directly optimises for the goal: seizure windows from different patients should be close, non-seizure windows should be far from seizure windows.
+- Uses `EmbeddingDataset` + `PKBatchSampler` with `max_per_patient=4` — caps per-patient contribution per batch to maximise cross-patient diversity
 
 ## Batch hard triplet strategy (batch_hard_triplet loss)
 

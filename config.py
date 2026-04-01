@@ -1,36 +1,14 @@
 """
 Configuration file for contrastive learning seizure detection pipeline.
 
-Supports two dataset formats:
-  - 'tuh': TUH ECG features (14 HRV features, columns: patient_id, split, label)
-  - 'teppe': Teppe dataset (29 HRV + 141 ACC features, columns: patient-id, training-split, label)
-
-Set DATASET_FORMAT below to switch between them.
+Dataset: Teppe (29 HRV + 141 ACC features, columns: patient-id, training-split, label)
 """
-
-# ============================================================================
-# DATASET FORMAT — set this to 'tuh' or 'teppe'
-# ============================================================================
-DATASET_FORMAT = 'teppe'
 
 # ============================================================================
 # DATA CONFIGURATION
 # ============================================================================
 
-# --- TUH format ---
-_TUH_DATA_CONFIG = {
-    'data_path': '/Users/laura/Documents/aura/tuh_ecg_features2.csv',
-    'patient_id_col': 'patient_id',
-    'label_col': 'label',
-    'split_col': 'split',
-    'train_split_name': 'train',
-    'test_split_name': 'dev',
-    'drop_columns': ['interval_index', 'interval_start_time', 'montage', 'session_id', 'file_id'],
-    'availability_cols': [],  # TUH has no availability flags
-}
-
-# --- Teppe format ---
-_TEPPE_DATA_CONFIG = {
+DATA_CONFIG = {
     'data_path': '/home/adm-laura/git/feat-grid-all-intersect-clean.csv',
     'patient_id_col': 'patient-id',
     'label_col': 'label',
@@ -39,18 +17,13 @@ _TEPPE_DATA_CONFIG = {
     'test_split_name': 'test',
     'drop_columns': ['timestamps', 'hrv_interval_index', 'hrv_interval_start_time'],
     'availability_cols': ['hrv_available', 'acc_available'],  # sensor availability flags
-}
 
-# Merge with shared settings
-_SHARED_DATA_CONFIG = {
     'checkpoint_dir': './checkpoints/',
     'results_dir': None,  # Auto-generated with timestamp if None
     'num_patients_train': None,  # Limit training patients (None for all)
     'use_weighted_sampling': True,
     'per_patient_normalization': True,  # z-score features relative to each patient's baseline
 }
-
-DATA_CONFIG = {**_SHARED_DATA_CONFIG, **(_TEPPE_DATA_CONFIG if DATASET_FORMAT == 'teppe' else _TUH_DATA_CONFIG)}
 
 
 # ============================================================================
