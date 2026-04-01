@@ -18,22 +18,66 @@ import random
 import os
 import time
 
-def visualize_umap(encoded_data, labels, patient_ids, results_dir):
-    # Ensure results directory exists
+def _plot_umap(embedding, labels, patient_ids, results_dir, prefix, title_suffix=''):
+    """Plot UMAP embedding colored by patient_ids and by label."""
+    os.makedirs(results_dir, exist_ok=True)
+
+    # Patient ID plot
+    fig, ax = plt.subplots(figsize=(10, 8))
+    unique_pids = np.unique(patient_ids)
+    cmap = plt.cm.get_cmap('tab10' if len(unique_pids) <= 10 else 'tab20')
+    for i, pid in enumerate(unique_pids):
+        mask = patient_ids == pid
+        ax.scatter(embedding[mask, 0], embedding[mask, 1],
+                   s=5, alpha=0.4, c=[cmap(i % cmap.N)], label=str(pid))
+    ax.legend(markerscale=3, fontsize=9)
+    ax.set_title(f'UMAP — by patient{title_suffix}', fontsize=14)
+    ax.set_xlabel('UMAP 1')
+    ax.set_ylabel('UMAP 2')
+    plt.savefig(os.path.join(results_dir, f'{prefix}_patient_ids.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Label plot: draw seizure points larger and on top
+    str_labels = np.array(['seizure' if l == 1 else 'no seizure' for l in labels])
+    fig, ax = plt.subplots(figsize=(10, 8))
+    mask_ns = str_labels == 'no seizure'
+    ax.scatter(embedding[mask_ns, 0], embedding[mask_ns, 1],
+               s=5, alpha=0.3, c='#1f77b4', label='no seizure')
+    mask_s = str_labels == 'seizure'
+    ax.scatter(embedding[mask_s, 0], embedding[mask_s, 1],
+               s=40, alpha=0.9, c='#d62728', edgecolors='black',
+               linewidths=0.5, label='seizure', zorder=10)
+    ax.legend(markerscale=1.5, fontsize=11)
+    ax.set_title(f'UMAP — by label{title_suffix}', fontsize=14)
+    ax.set_xlabel('UMAP 1')
+    ax.set_ylabel('UMAP 2')
+    plt.savefig(os.path.join(results_dir, f'{prefix}_labels.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def visualize_umap(encoded_data, labels, patient_ids, results_dir, prefix='umap',
+                   test_data=None, test_labels=None, test_patient_ids=None):
+    """Generate UMAP visualizations.
+
+    When test_data is provided, UMAP is fit on encoded_data (train) and both
+    train and test are transformed into the same space for comparable plots.
+    """
     os.makedirs(results_dir, exist_ok=True)
 
     print("Computing UMAP embedding...")
-    mapper = umap.UMAP(random_state=42, metric='cosine', n_neighbors=15, min_dist=0.1).fit(encoded_data)
+    mapper = umap.UMAP(random_state=42, metric='cosine', n_neighbors=15, min_dist=0.1)
+    train_embedding = mapper.fit_transform(encoded_data)
     print("UMAP computation completed!")
 
     print("Creating UMAP plots...")
-    umap.plot.points(mapper, labels=patient_ids)
-    plt.savefig(os.path.join(results_dir, 'umap_plot_patient_ids.png'), dpi=300, bbox_inches='tight')
-    plt.close()
+    _plot_umap(train_embedding, labels, patient_ids, results_dir, prefix, title_suffix=' (train)')
 
-    umap.plot.points(mapper, labels=labels)
-    plt.savefig(os.path.join(results_dir, 'umap_plot_labels.png'), dpi=300, bbox_inches='tight')
-    plt.close()
+    if test_data is not None:
+        print("Transforming test data into same UMAP space...")
+        test_embedding = mapper.transform(test_data)
+        _plot_umap(test_embedding, test_labels, test_patient_ids, results_dir,
+                   f'{prefix}_test', title_suffix=' (test)')
+
     print("UMAP plots saved!")
 
 def visualize_embeddings(encoded_data, labels, results_dir):
@@ -53,7 +97,7 @@ def visualize_embeddings(encoded_data, labels, results_dir):
 
     # Create layout
     layout = go.Layout(
-        title="TUH Dataset - Encoded and PCA Reduced 3D Scatter Plot",
+        title="Encoded and PCA Reduced 3D Scatter Plot",
         scene=dict(
             xaxis=dict(title="PC1"),
             yaxis=dict(title="PC2"),

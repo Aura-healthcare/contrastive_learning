@@ -1,5 +1,7 @@
 """
 Configuration file for contrastive learning seizure detection pipeline.
+
+Dataset: Teppe (29 HRV + 141 ACC features, columns: patient-id, training-split, label)
 """
 
 # ============================================================================
@@ -7,21 +9,20 @@ Configuration file for contrastive learning seizure detection pipeline.
 # ============================================================================
 
 DATA_CONFIG = {
-    # Data paths
-    'data_path': '/Users/laura/Documents/aura/tuh_ecg_features2.csv',
-    'checkpoint_dir': './checkpoints/',
-    'results_dir': None,  # Will be auto-generated with timestamp if None
-
-    # Data preprocessing
-    'num_patients_train': 10,  # Limit training to N patients for quick experiments (None for all)
-    'use_weighted_sampling': True,  # Use weighted sampling to balance across patients
-
-    # Features to drop
-    'drop_columns': ['interval_index', 'interval_start_time', 'montage', 'session_id', 'file_id'],
-
-    # Data splits
+    'data_path': '/home/adm-laura/git/feat-grid-all-intersect-clean.csv',
+    'patient_id_col': 'patient-id',
+    'label_col': 'label',
+    'split_col': 'training-split',
     'train_split_name': 'train',
-    'test_split_name': 'dev',
+    'test_split_name': 'test',
+    'drop_columns': ['timestamps', 'hrv_interval_index', 'hrv_interval_start_time'],
+    'availability_cols': ['hrv_available', 'acc_available'],  # sensor availability flags
+
+    'checkpoint_dir': './checkpoints/',
+    'results_dir': None,  # Auto-generated with timestamp if None
+    'num_patients_train': None,  # Limit training patients (None for all)
+    'use_weighted_sampling': True,
+    'per_patient_normalization': True,  # z-score features relative to each patient's baseline
 }
 
 
@@ -29,17 +30,17 @@ DATA_CONFIG = {
 # MODEL CONFIGURATION
 # ============================================================================
 
+# input_dim is computed automatically from the data in launch_train.py
+# Set to None for auto-detection, or override with an int.
 MODEL_CONFIG = {
-    # Input/output dimensions
-    'input_dim': 14,
-    'embedding_dim': 1024,
+    'input_dim': None,  # Auto-detected from data
+    'embedding_dim': 64,  # Reduced from 128 (better for generalisation)
     'num_classes': 2,
 
-    # Embedding model architecture
-    'num_residual_blocks': 3,  # Number of residual blocks in each stage
+    'num_residual_blocks': 2,  # Reduced from 3
+    'embedding_dropout': 0.4, # Increased from 0.2 to reduce overfitting on seizure samples
 
-    # Classifier architecture
-    'classifier_hidden_dims': [256, 64],  # Hidden layer sizes in classifier head
+    'classifier_hidden_dims': [64, 32],
     'classifier_dropout': 0.3,
 }
 
@@ -49,22 +50,25 @@ MODEL_CONFIG = {
 # ============================================================================
 
 EMBEDDING_TRAINING_CONFIG = {
-    'epochs': 10,
+    'epochs': 30,   # Reduced from 100 — fewer seizure samples get over-compressed with too many epochs
     'batch_size': 1024,
-    'learning_rate': 5e-3,
+    'learning_rate': 1e-3,  # Reduced from 5e-3
 
-    # Loss function options: 'contrastive', 'triplet', 'batch_hard_triplet'
-    'loss_type': 'batch_hard_triplet',
+    # Loss function options: 'contrastive', 'triplet', 'batch_hard_triplet', 'supcon'
+    'loss_type': 'supcon',
 
     # Loss function parameters
     'margin': 1.0,              # For triplet and batch_hard_triplet
-    'temperature': 0.1,         # For contrastive loss
+    'temperature': 0.07,        # Reduced from 0.3 — sharper focus on hard negatives
     'num_pairs': 5000,          # For contrastive dataset
+    'pk_p': 16,                 # PKBatchSampler: number of patients per batch (supcon)
+    'pk_k': 16,                 # PKBatchSampler: number of samples per patient per batch (supcon)
+    'max_per_patient': 4,       # Cap per-patient samples per class per batch (forces cross-patient diversity)
 
     # Learning rate scheduler
     'use_scheduler': True,
-    'scheduler_step_size': 7,
-    'scheduler_gamma': 0.3,
+    'scheduler_step_size': 10,
+    'scheduler_gamma': 0.5,
 
     # Checkpointing
     'save_checkpoints': True,
@@ -77,9 +81,9 @@ EMBEDDING_TRAINING_CONFIG = {
 # ============================================================================
 
 CLASSIFIER_TRAINING_CONFIG = {
-    'epochs': 20,
+    'epochs': 5,  # Set low for testing (use 20+ for real training)
     'batch_size': 128,
-    'learning_rate': 1e-4,  # Lower LR for fine-tuning (was 1e-3)
+    'learning_rate': 1e-4,
 
     # Learning rate scheduler
     'use_scheduler': True,
@@ -87,8 +91,8 @@ CLASSIFIER_TRAINING_CONFIG = {
     'scheduler_gamma': 0.5,
 
     # Fine-tuning options (Two-stage approach)
-    'freeze_embeddings': False,  # Stage 2: Fine-tune patient embeddings for seizure detection
-    'unfreeze_last_n_blocks': None,  # None = all layers, or int (1,2,3) for partial unfreezing
+    'freeze_embeddings': True,  # Changed: freeze embeddings by default
+    'unfreeze_last_n_blocks': None,
 }
 
 
@@ -109,7 +113,7 @@ EVAL_CONFIG = {
 # ============================================================================
 
 DEVICE_CONFIG = {
-    'use_cuda': True,  # Set to False to force CPU
+    'use_cuda': False,  # Set to False to force CPU
     'cuda_device': 0,  # GPU device number
 }
 
