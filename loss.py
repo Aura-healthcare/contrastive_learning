@@ -63,9 +63,10 @@ class SupervisedContrastiveLoss(nn.Module):
         pos_mask  = (labels.unsqueeze(1) == labels.unsqueeze(0)) & ~self_mask
 
         # Exclude same-patient pairs from positives — only cross-patient positives count
-        if patient_ids is not None:
-            same_patient = (patient_ids.unsqueeze(1) == patient_ids.unsqueeze(0))
-            pos_mask = pos_mask & ~same_patient
+        #if patient_ids is not None:
+         #   same_patient = (patient_ids.unsqueeze(1) == patient_ids.unsqueeze(0))
+          #  pos_mask = pos_mask & ~same_patient
+        
 
         # Numerical stability: subtract row max before exp
         sim = sim - sim.max(dim=1, keepdim=True).values.detach()

@@ -18,7 +18,104 @@ import random
 import os
 import time
 
-def _plot_umap(embedding, labels, patient_ids, results_dir, prefix, title_suffix=''):
+def _lighten_color(rgb, factor=0.55):
+    """Mix an RGB colour with white. factor=1 → original, factor=0 → white."""
+    return tuple(c + (1.0 - c) * (1.0 - factor) for c in rgb)
+
+
+def _darken_color(rgb, factor=0.65):
+    """Darken an RGB colour. factor=1 → original, factor=0 → black."""
+    return tuple(c * factor for c in rgb)
+
+
+def _plot_umap_patient_seizure(embedding, labels, patient_ids, results_dir, prefix,
+                               title_suffix='', pid_map=None):
+    """UMAP combinant patient et statut crise : une couleur par patient,
+    teinte claire + cercle pour les non-crises, teinte foncée + croix pour les crises."""
+    os.makedirs(results_dir, exist_ok=True)
+
+    unique_pids = np.unique(patient_ids)
+    n_patients = len(unique_pids)
+    cmap = plt.cm.get_cmap('tab10' if n_patients <= 10 else 'tab20')
+
+    fig, ax = plt.subplots(figsize=(13, 9))
+
+    for i, pid in enumerate(unique_pids):
+        pid_mask = patient_ids == pid
+        base_rgb = cmap(i % cmap.N)[:3]
+        light_rgb = _lighten_color(base_rgb, factor=0.55)
+        dark_rgb = _darken_color(base_rgb, factor=0.65)
+        pid_label = pid_map.get(int(pid), str(pid)) if pid_map else str(pid)
+
+        # Non-crise : couleur claire, marqueur cercle, en arrière-plan
+        mask_ns = pid_mask & (labels == 0)
+        if mask_ns.any():
+            ax.scatter(embedding[mask_ns, 0], embedding[mask_ns, 1],
+                       c=[light_rgb], s=15, alpha=0.55, marker='o',
+                       label=f'{pid_label} — non-crise')
+
+        # Crise : couleur foncée, marqueur croix, au premier plan
+        mask_s = pid_mask & (labels == 1)
+        if mask_s.any():
+            ax.scatter(embedding[mask_s, 0], embedding[mask_s, 1],
+                       c=[dark_rgb], s=70, alpha=0.9, marker='x',
+                       linewidths=1.8, zorder=10,
+                       label=f'{pid_label} — crise')
+
+    ax.set_title(f'UMAP — crises et non-crises par patient{title_suffix}', fontsize=14)
+    ax.set_xlabel('UMAP 1')
+    ax.set_ylabel('UMAP 2')
+
+    ncol = max(1, n_patients // 8)
+    legend_fontsize = 7 if n_patients > 5 else 9
+    ax.legend(markerscale=2, fontsize=legend_fontsize,
+              bbox_to_anchor=(1.02, 1), loc='upper left',
+              borderaxespad=0., ncol=ncol)
+
+    plt.savefig(os.path.join(results_dir, f'{prefix}_patient_seizure.png'),
+                dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _plot_umap_seizure_type(embedding, seizure_types, results_dir, prefix, title_suffix=''):
+    """UMAP colorée par type de crise (une couleur par catégorie), avec les
+    points non-crise (NaN) en gris clair en arrière-plan."""
+    if seizure_types is None:
+        return
+
+    seizure_types = np.asarray(seizure_types, dtype=object)
+    background_mask = pd.isna(seizure_types)
+    categories = sorted(set(seizure_types[~background_mask]))
+    if not categories:
+        return
+
+    os.makedirs(results_dir, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(12, 9))
+
+    if background_mask.any():
+        ax.scatter(embedding[background_mask, 0], embedding[background_mask, 1],
+                   s=5, alpha=0.25, c='lightgrey', label='no seizure', zorder=1)
+
+    cmap = plt.cm.get_cmap('tab10' if len(categories) <= 10 else 'tab20')
+    for i, cat in enumerate(categories):
+        mask = seizure_types == cat
+        ax.scatter(embedding[mask, 0], embedding[mask, 1],
+                   s=45, alpha=0.9, c=[cmap(i % cmap.N)], edgecolors='black',
+                   linewidths=0.4, label=cat, zorder=10)
+
+    ax.set_title(f'UMAP — by seizure type{title_suffix}', fontsize=14)
+    ax.set_xlabel('UMAP 1')
+    ax.set_ylabel('UMAP 2')
+    ax.legend(markerscale=1.5, fontsize=8, bbox_to_anchor=(1.02, 1),
+              loc='upper left', borderaxespad=0.)
+
+    plt.savefig(os.path.join(results_dir, f'{prefix}_seizure_type.png'),
+                dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _plot_umap(embedding, labels, patient_ids, results_dir, prefix, title_suffix='', pid_map=None,
+               seizure_types=None):
     """Plot UMAP embedding colored by patient_ids and by label."""
     os.makedirs(results_dir, exist_ok=True)
 
@@ -54,13 +151,26 @@ def _plot_umap(embedding, labels, patient_ids, results_dir, prefix, title_suffix
     plt.savefig(os.path.join(results_dir, f'{prefix}_labels.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
+    # Combined patient + seizure status plot
+    _plot_umap_patient_seizure(embedding, labels, patient_ids, results_dir, prefix, title_suffix,
+                               pid_map=pid_map)
+
+    # Seizure type plot
+    _plot_umap_seizure_type(embedding, seizure_types, results_dir, prefix, title_suffix)
+
 
 def visualize_umap(encoded_data, labels, patient_ids, results_dir, prefix='umap',
-                   test_data=None, test_labels=None, test_patient_ids=None):
+                   test_data=None, test_labels=None, test_patient_ids=None, pid_map=None,
+                   seizure_types=None, test_seizure_types=None):
     """Generate UMAP visualizations.
 
     When test_data is provided, UMAP is fit on encoded_data (train) and both
     train and test are transformed into the same space for comparable plots.
+
+    seizure_types / test_seizure_types (optional): array aligned with
+    encoded_data / test_data giving the seizure type label per sample (NaN
+    for non-seizure samples). When provided, an extra UMAP colored by
+    seizure type (with legend) is generated.
     """
     os.makedirs(results_dir, exist_ok=True)
 
@@ -70,13 +180,15 @@ def visualize_umap(encoded_data, labels, patient_ids, results_dir, prefix='umap'
     print("UMAP computation completed!")
 
     print("Creating UMAP plots...")
-    _plot_umap(train_embedding, labels, patient_ids, results_dir, prefix, title_suffix=' (train)')
+    _plot_umap(train_embedding, labels, patient_ids, results_dir, prefix,
+               title_suffix=' (train)', pid_map=pid_map, seizure_types=seizure_types)
 
     if test_data is not None:
         print("Transforming test data into same UMAP space...")
         test_embedding = mapper.transform(test_data)
         _plot_umap(test_embedding, test_labels, test_patient_ids, results_dir,
-                   f'{prefix}_test', title_suffix=' (test)')
+                   f'{prefix}_test', title_suffix=' (test)', pid_map=pid_map,
+                   seizure_types=test_seizure_types)
 
     print("UMAP plots saved!")
 

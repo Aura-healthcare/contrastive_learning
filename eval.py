@@ -21,6 +21,9 @@ import base64
 import json
 import logging
 import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import numpy as np
 import pandas as pd
@@ -46,10 +49,22 @@ from config import EVAL_CONFIG
 # DATA LOADING
 # ============================================================================
 
-def _encode_patient_ids(series):
-    """Map patient IDs (possibly strings like '01-001') to integer codes."""
-    codes, _ = pd.factorize(series)
-    return codes
+def _encode_patient_ids(series, pid_map=None):
+    """Map patient IDs to integer codes, reusing an existing mapping if provided."""
+    if pid_map is None:
+        codes, uniques = pd.factorize(series)
+        pid_map = {i: str(u) for i, u in enumerate(uniques)}
+        return codes, pid_map
+
+    reverse = {v: k for k, v in pid_map.items()}
+    codes = []
+    for pid_str in series.astype(str):
+        if pid_str not in reverse:
+            new_code = len(pid_map)
+            pid_map[new_code] = pid_str
+            reverse[pid_str] = new_code
+        codes.append(reverse[pid_str])
+    return np.array(codes), pid_map
 
 
 def _per_patient_normalize(df, feature_cols, pid_col, label_col):
@@ -60,7 +75,7 @@ def _per_patient_normalize(df, feature_cols, pid_col, label_col):
         if len(baseline) < 2:
             baseline = grp
         pmean = baseline[feature_cols].mean()
-        pstd = baseline[feature_cols].std().replace(0, 1)
+        pstd = baseline[feature_cols].std().fillna(1).replace(0, 1)
         df.loc[grp.index, feature_cols] = (grp[feature_cols] - pmean) / pstd
     return df
 
@@ -73,21 +88,30 @@ def load_data(config):
     data_cfg = config["data_config"]
     pid_col = data_cfg.get("patient_id_col", "patient_id")
     label_col = data_cfg.get("label_col", "label")
-    split_col = data_cfg.get("split_col", "split")
     avail_cols = data_cfg.get("availability_cols", [])
+    seizure_type_col = "seizure_type"
 
     df = pd.read_csv(data_cfg["data_path"])
-    drop_cols = [c for c in data_cfg["drop_columns"] if c in df.columns]
+    # Some HRV features (e.g. hrv_cvi, hrv_sampen) can be +/-inf when the
+    # underlying computation divides by zero. Treat them as missing so they
+    # don't poison mean/std and propagate Inf through normalization.
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    # Keep seizure_type around (excluded from features below, not dropped) so it
+    # can be used for the "by seizure type" UMAP visualization.
+    drop_cols = [c for c in data_cfg["drop_columns"] if c in df.columns and c != seizure_type_col]
     df.drop(columns=drop_cols, inplace=True)
 
-    train_df = df[df[split_col] == data_cfg["train_split_name"]].drop(columns=[split_col])
-    test_df = df[df[split_col] == data_cfg["test_split_name"]].drop(columns=[split_col])
+    patient_split = data_cfg["patient_split"]
+    train_df = df[df[pid_col].isin(patient_split["train"])]
+    test_df = df[df[pid_col].isin(patient_split["test"])]
 
     if data_cfg["num_patients_train"] is not None:
         pids = train_df[pid_col].unique()
         train_df = train_df[train_df[pid_col].isin(pids[: data_cfg["num_patients_train"]])]
 
     non_feature = [label_col, pid_col] + [c for c in avail_cols if c in train_df.columns]
+    if seizure_type_col in train_df.columns:
+        non_feature.append(seizure_type_col)
     feature_cols = [c for c in train_df.columns if c not in non_feature]
 
     # Drop constant features
@@ -114,13 +138,21 @@ def load_data(config):
         train_df[feature_cols] = (train_df[feature_cols] - mean) / std
         test_df[feature_cols] = (test_df[feature_cols] - mean) / std
 
-    def split_to_tensors(split_df):
+    def split_to_tensors(split_df, pid_map=None):
         feats = torch.tensor(split_df[feature_cols].to_numpy(), dtype=torch.float32)
         labels = torch.tensor(split_df[label_col].to_numpy(), dtype=torch.long)
-        pids = torch.tensor(_encode_patient_ids(split_df[pid_col]), dtype=torch.long)
-        return feats, labels, pids
+        codes, pid_map = _encode_patient_ids(split_df[pid_col], pid_map=pid_map)
+        pids = torch.tensor(codes, dtype=torch.long)
+        return feats, labels, pids, pid_map
 
-    return (*split_to_tensors(train_df), *split_to_tensors(test_df))
+    train_feats, train_labels, train_pids, pid_map = split_to_tensors(train_df)
+    test_feats, test_labels, test_pids, _ = split_to_tensors(test_df, pid_map=pid_map)
+
+    train_seizure_types = train_df[seizure_type_col].to_numpy() if seizure_type_col in train_df.columns else None
+    test_seizure_types = test_df[seizure_type_col].to_numpy() if seizure_type_col in test_df.columns else None
+
+    return (train_feats, train_labels, train_pids, train_seizure_types,
+            test_feats, test_labels, test_pids, test_seizure_types)
 
 
 # ============================================================================
@@ -156,31 +188,75 @@ def extract_embeddings(model, features, labels, pids, device, batch_size=512):
 def _eval_knn_faiss(train_embs, train_labels, test_embs, test_labels, k=5, nprobe=32):
     """Fast approximate kNN using FAISS IVF index (cosine on L2-normed vectors)."""
     # L2-normalize so inner product == cosine similarity
-    train_normed = train_embs / (np.linalg.norm(train_embs, axis=1, keepdims=True) + 1e-8)
+    # la normalisation L2 c'est diviser chaque vecteur par sa propre norme
+    # resultat ; tous les vecteurs ont une norme de 1, on a effacé l'info de longueur, on ne garde que la direction
+    # formule habituelle de la similarité cosinus c'est A.B / (norme de A x nome de B)
+    # sauf que puisqu'on a norme de A et norme de B = 1, le dénominateur vaut 1 et disparait 
+    # DONC le produit scalaire A.B correspond directement au cosinus de l'angle
+    train_normed = train_embs / (np.linalg.norm(train_embs, axis=1, keepdims=True) + 1e-8) # + 1e-8 pour éviter division par 0
     test_normed = test_embs / (np.linalg.norm(test_embs, axis=1, keepdims=True) + 1e-8)
 
     train_normed = np.ascontiguousarray(train_normed.astype(np.float32))
     test_normed = np.ascontiguousarray(test_normed.astype(np.float32))
 
-    d = train_normed.shape[1]
+    d = train_normed.shape[1] # d : dimension des vecteurs d'embedding
     n_train = train_normed.shape[0]
-    nlist = int(np.sqrt(n_train))
+    nlist = int(np.sqrt(n_train)) # nlist c'est le nombre de centroides/cluster
+    # on prend la racine du nombre de points d'entrainement 
+    # ex: √2500 = 50 clusters
 
-    quantizer = faiss.IndexFlatIP(d)
-    index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+    quantizer = faiss.IndexFlatIP(d) # cette ligne crée un quantizer (quantififcateur) qui utilise une recherche exacte par produit scalaire (Inner Product) pour comparer un vecteur aux centroides
+    # IndexFlatIP signifie : "Pour trouver le centroïde le plus proche d'un vecteur donné, calcule exactement le produit scalaire entre ce vecteur et TOUS les centroïdes existants"
+    # Il ne trouve pas les centroïdes lui-même, il définit seulement la méthode de quantification (recherche exacte via IP). Les centroïdes n'existent pas encore à ce stade !
+
+    # PREPARATION DE L'INDEX FAISS
+    index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT) # cette ligne crée un index FAISS pour la recherche de voisins les plus proches rapide
+        # index IndexIVFFlat : c'est un index de type IVF (Inverted File) 
+       
+    # ENTRAINEMENT DE L'INDEX : FAISS va apprendre les centroides des clusters à partir des données d'entraînement
     index.train(train_normed)
+    # Utilise un algorithme comme k-means en interne pour partitionner les données en nlist clusters et calculer les positions des centroïdes (les "centres" de chaque cluster)
+    # Après train(), les centroïdes sont définis et stockés dans l'index
+    # initialisation : tire nlist vecteurs aléatoires comme centroïdes initiaux, puis itère :
+    # 1. assignation : chaque vecteur de train_normed est assigné au centroïde le plus proche (en termes de produit scalaire)
+    # 2. mise à jour : chaque centroïde est recalculé comme la moyenne des vecteurs qui lui sont assignés
+    # Répète jusqu'à convergence ou un nombre max d'itérations. À la fin, on a nlist centroïdes qui représentent les clusters de l'espace d'embedding.
+
+    # FAISS connait mtn les centroides après le train mais l'index est vide
+    # add() permet de ranger chaque vecteur de train_normed dans le bon cluster : 
+    # pour chq vecteur, FAISS calcule à quel centroide il est le plus proche et le place dans la liste de ce cluster
+    # cluster C1 → [vecteur_4, vecteur_17, vecteur_82, ...]
+    # cluster C2 → [vecteur_1, vecteur_9,  vecteur_33, ...]
+    # cluster C3 → [vecteur_6, vecteur_44, vecteur_71, ...]
     index.add(train_normed)
-    index.nprobe = nprobe
+
+    # ATTENTION : les vecteurs de test (test_normed) ne sont jamais ajoutés à l'index
+    # Ils ne servent qu'en entrée de .search() — ce sont les requêtes 
+    # Les vecteurs de train sont ceux qu'on cherche à retrouver
+
+    index.nprobe = nprobe # index.search() va chercher uniquement dans les listes des nprobe clusters les plus proches de la requête, pas dans tous les vecteurs
     logging.info(f"FAISS IVF index: nlist={nlist}, nprobe={nprobe}")
 
-    distances, indices = index.search(test_normed, k)
+    distances, indices = index.search(test_normed, k) # prend chaque vecteur de test et cherche ses 5 voisins les plus proches parmi tous les vecteurs de train indexés
+    # Elle retourne deux matrices : 
+    # indices : Ce sont les positions dans train_normed. indices[0][0] = 4 signifie que le voisin le plus proche du point de test 0 est train_normed[4]
+    # exemple : [[  4,  17,  82,   9,  33 ], ...]   ← les 5 voisins du point de test 0
+
+    # distances : Ce sont les scores de similarité cosinus (produit scalaire entre vecteurs normés), triés du plus proche au plus loin
+    # Une valeur proche de 1.0 = très similaire, proche de 0 = peu similaire
+    # [[ 0.98,  0.91,  0.87,  0.82,  0.79 ], ...]
+    # MAIS distances pas utilisé dans la prédiction
 
     # Majority vote
     neighbor_labels = train_labels[indices]  # (n_test, k)
     preds = np.array([np.bincount(row.astype(int), minlength=2).argmax() for row in neighbor_labels])
+    # preds : "Quelle est la classe ?"" bincount compte les votes par classe, puis argmax prend l'index du maximum
+    # exemple : 1 vote pour la classe 0, 4 votes pour la classe 1
 
     # Probability estimate (fraction of positive neighbors)
     probs = neighbor_labels.astype(float).mean(axis=1)
+    # probs : "À quel point est-on sûr ?" On convertit les étiquettes en float (0.0 ou 1.0) et on prend la moyenne. 
+    # C'est simplement la fraction de voisins positifs. exemple : (1+1+1+1+0)/5 = 0.80.
 
     return preds, probs
 
@@ -213,14 +289,27 @@ def eval_knn(train_embs, train_labels, test_embs, test_labels, k=5):
 
 def eval_linear_probe(train_embs, train_labels, test_embs, test_labels):
     """Logistic regression trained on frozen train embeddings, evaluated on test."""
-    clf = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42)
-    clf.fit(train_embs, train_labels)
-    preds = clf.predict(test_embs)
+
+    # crée un classifieur de régression logistique avec un maximum de 1000 itérations, 
+    # une pénalité de classe équilibrée pour gérer les classes déséquilibrées
+    # et une graine aléatoire fixe pour la reproductibilité
+    clf = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42) 
+    
+    clf.fit(train_embs, train_labels) # entrâine le classifieur sur les embeddings d'entraînement et leurs labels
+
+
+    preds = clf.predict(test_embs) # prédit les labels des embeddings de test en utilisant le classifieur entraîné
+    # preds contient les prédictions finales (0 ou 1 selon le modèle binaire)
+
+
     probs = clf.predict_proba(test_embs)[:, 1]
+    # probs contient les probabilités prédites pour la classe positive (classe 1) pour chaque échantillon de test
+    # predict_proba renvoie unematrice de probabilités à 2 colonnes, on prend la colonne de la classe positive
+    
 
     precision, recall, f1, _ = precision_recall_fscore_support(
         test_labels, preds, average="binary", zero_division=0
-    )
+    ) # Calcule précision, rappel et score F1 en comparant les labels réels test_labels aux prédictions preds.
     try:
         roc_auc = float(roc_auc_score(test_labels, probs))
     except ValueError:
@@ -239,7 +328,7 @@ def eval_linear_probe(train_embs, train_labels, test_embs, test_labels):
 # LOPO — LEAVE-ONE-PATIENT-OUT
 # ============================================================================
 
-def eval_lopo(all_embs, all_labels, all_pids):
+def eval_lopo(all_embs, all_labels, all_pids): # embeddings pour tous les échantillons (train + test), labels er patient_ids correspondants
     """
     For each patient: train a logistic regression on all other patients' embeddings,
     evaluate on the held-out patient. Uses the full dataset (train + test combined)
@@ -247,47 +336,66 @@ def eval_lopo(all_embs, all_labels, all_pids):
 
     Returns macro metrics (concatenated predictions across all folds) and per-patient metrics.
     """
-    unique_pids = np.unique(all_pids)
-    per_patient = {}
-    concat_preds, concat_true = [], []
+    unique_pids = np.unique(all_pids) # extraire liste des patients uniaques présents dans all_pids
+    # chaque patent sera traité comme un fold de validation à part entière : on va faire autant de folds que de patients,
+    # et à chaque fois on laisse un patient de côté pour le test et on entraîne sur les autres
 
-    for pid in tqdm(unique_pids, desc="LOPO"):
-        mask_test = all_pids == pid
-        mask_train = ~mask_test
+    per_patient = {} # initialiser un dictionnaire vide pour stocker les métriques par patient
+
+    concat_preds, concat_true = [], []
+    # initialise deux listes vides pour stocker les prédictions concaténées et les labels réels concaténés de tous les patients
+    # elles serviront à calculer des métroques globales (macro) à la fin, en traitant tous les échantillons comme un seul ensemble une fois tous les folds traités
+
+    for pid in tqdm(unique_pids, desc="LOPO"): # parcourt chaque patient unique et affiche une barre de progression
+        mask_test = all_pids == pid # crée un masque booléen pour identifier les échantillons appartenant au patient actuel (pid) 
+        # ce masque servira à sélectionner la part de test du fold, composée de tous les échantillons qui appartiennent au patient actuel
+
+
+        mask_train = ~mask_test # masque inverse pour sélectionner tous les échantillons sauf ceux du patient actuel
+        # ce sera la part d'entrainement du fold, composée de tous les échantillons qui n'appartiennent pas au patient actuel
 
         # Skip degenerate folds
-        if mask_train.sum() == 0 or mask_test.sum() == 0:
+        if mask_train.sum() == 0 or mask_test.sum() == 0: # ignore les folds invalides où il n'y a pas d'échantillon de train ou de test
             continue
-        if len(np.unique(all_labels[mask_train])) < 2:
+        if len(np.unique(all_labels[mask_train])) < 2: # ignore les folds si ne contient pas les 2 classes
             continue
 
-        clf = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42)
-        clf.fit(all_embs[mask_train], all_labels[mask_train])
-        preds = clf.predict(all_embs[mask_test])
+        clf = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42) # crée un classifieur de régression logistique avec les mêmes paramètres que pour le linear probe classique
+        
+        clf.fit(all_embs[mask_train], all_labels[mask_train]) # entraîne le modèle sur les embeddings et labels de tous les autres patients
+        # mask_train sélectionne les échantillons d'entraînement pour ce pli LOPO.
 
-        concat_preds.extend(preds)
-        concat_true.extend(all_labels[mask_test])
 
-        # Per-patient metrics only when both classes are present in the test fold
-        if len(np.unique(all_labels[mask_test])) >= 2:
+        preds = clf.predict(all_embs[mask_test]) # Prédit les labels sur les embeddings du patient tenu à l'écart.
+        # mask_test sélectionne les exemples du patient testé.
+
+        concat_preds.extend(preds) # ajoute les prédictions de ce pli à la liste globale concat_preds.
+        concat_true.extend(all_labels[mask_test]) # ajoute les labels vrais de ce pli à la liste globale concat_true
+
+        # Per-patient metrics only when both classes are present in the test fold (otherwise metrics will be misleading)
+        if len(np.unique(all_labels[mask_test])) >= 2: # vérifie si le patient testé a des exemples des deux classes dans son ensemble de test.
             p, r, f1, _ = precision_recall_fscore_support(
                 all_labels[mask_test], preds, average="binary", zero_division=0
             )
-            per_patient[int(pid)] = {
+            per_patient[int(pid)] = { # stocke les métriques calculées pour ce patient dans le dictionnaire per_patient
                 "accuracy": float(accuracy_score(all_labels[mask_test], preds)),
                 "precision": float(p),
                 "recall": float(r),
                 "f1": float(f1),
-                "n_samples": int(mask_test.sum()),
+                "n_samples": int(mask_test.sum()), # inclut aussi le nombre d'échantillons de test du patient (n_samples)
+
             }
 
     concat_preds = np.array(concat_preds)
     concat_true = np.array(concat_true)
 
+    # calcule les métriques globales (macro) en traitant toutes les prédictions et tous les labels concaténés comme un seul ensemble
+    # cela donne une mesure d'ensemble sur tous les folds LOPO
     macro_p, macro_r, macro_f1, _ = precision_recall_fscore_support(
         concat_true, concat_preds, average="binary", zero_division=0
     )
 
+    # retourne un dictionnaire avec métriques globaux
     return {
         "macro_accuracy": float(accuracy_score(concat_true, concat_preds)),
         "macro_precision": float(macro_p),
@@ -303,6 +411,9 @@ def eval_lopo(all_embs, all_labels, all_pids):
 # ============================================================================
 
 def eval_retrieval(query_embs, query_labels, gallery_embs, gallery_labels, k_values=(5, 10, 20)):
+    # query_embs : embeddings des exemples de requête (généralement les données de test)
+    # gallery_embs : embeddings de la galerie (généralement les données d'entraînement)
+    # k_values : liste des valeurs de K pour calculer Precision@K et Recall@K
     """
     For each query (test sample), rank the gallery (train samples) by cosine similarity.
     A gallery item is "relevant" if it shares the same label as the query.
@@ -317,51 +428,97 @@ def eval_retrieval(query_embs, query_labels, gallery_embs, gallery_labels, k_val
       - mAP@K: average precision over the ranked top-K list — rewards relevant items
         appearing earlier in the ranking.
     """
-    max_k = max(k_values)
+    max_k = max(k_values) # # k_values=(5,10,20) → max_k = 20
+    # détermine la valeur maximale de K demandée pour la recherche FAISS
+    # sert à rechercher le top-K le plus grand en une seule fois 
 
     logging.info(f"Retrieval: normalizing {len(query_embs)} queries and {len(gallery_embs)} gallery vectors...")
-    q_norm = query_embs / (np.linalg.norm(query_embs, axis=1, keepdims=True) + 1e-8)
-    g_norm = gallery_embs / (np.linalg.norm(gallery_embs, axis=1, keepdims=True) + 1e-8)
+    q_norm = query_embs / (np.linalg.norm(query_embs, axis=1, keepdims=True) + 1e-8) # normalise chaque vecteur pour que sa norme soit 1
+    g_norm = gallery_embs / (np.linalg.norm(gallery_embs, axis=1, keepdims=True) + 1e-8) # + 1e-8 évite la division par zéro si un vecteur est nul
 
     q_norm = np.ascontiguousarray(q_norm.astype(np.float32))
     g_norm = np.ascontiguousarray(g_norm.astype(np.float32))
 
-    d = g_norm.shape[1]
+    d = g_norm.shape[1] # récupère la dimension de chaque vecteur d'embedding
 
-    n_gallery = len(g_norm)
-    nlist = int(np.sqrt(n_gallery))
-    nprobe = 32
+    n_gallery = len(g_norm) # nombre d'éléments dans la galerie
+    nlist = int(np.sqrt(n_gallery)) # nombre de clusters pour l'index FAISS, typiquement la racine carrée du nombre d'éléments de la galerie
+    nprobe = 32 # nombre de clusters à explorer 
     logging.info(f"Retrieval: building FAISS IVF index (dim={d}, gallery={n_gallery}, nlist={nlist}, nprobe={nprobe})...")
-    quantizer = faiss.IndexFlatIP(d)
-    index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
-    index.train(g_norm)
-    index.add(g_norm)
-    index.nprobe = nprobe
+    
+    quantizer = faiss.IndexFlatIP(d) # Crée un quantizer FAISS qui compare les vecteurs par produit scalaire (Inner Product)
+    # ce quantizer sera utilisé pour assigner les vecteurs aux clusters
+
+    index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT) # Crée un index IVF plat qui utilise le quantizer défini précédemment, avec la métrique de similarité par produit scalaire
+    
+    index.train(g_norm) # entraîne l'index FAISS sur les vecteurs de la galerie, FAISS apprend les centroïdes des clusters à partir de ces vecteurs
+    
+    index.add(g_norm) # ajoute les vecteurs de la galerie à l'index après entraînement 
+
+    index.nprobe = nprobe # définit combien de clusters FAISS doit explorer pendant la recherche
+    # Plus nprobe est grand, plus la recherche est précise, mais plus elle est lente
     logging.info(f"Retrieval: searching top-{max_k} for {len(q_norm)} queries...")
-    _, indices = index.search(q_norm, max_k)
+
+    _, indices = index.search(q_norm, max_k) # recherche les max_k voisins les plus proches dans la gallerie pour chaque requête
+    # on ignore les distances on ne garde que les indices 
+    # exemple : indices.shape → (100, 20)
+    # indices[0] → [4821, 312, 7043, 18, 9901, ...]   ← positions des 20 voisins de la requête 0
     logging.info("Retrieval: FAISS search done, computing metrics...")
 
     # Pre-count relevant items per query label for recall
     label_counts = {}
-    for lbl in np.unique(query_labels):
+    for lbl in np.unique(query_labels): # calcule combien d'éléments pertinents existent dans la galerie pour chaque label de requête.
         label_counts[lbl] = int((gallery_labels == lbl).sum())
+    # exemple : label_counts = {
+    # 0: 6000,   ← 6000 items de label 0 dans la gallery
+    # 1: 4000    ← 4000 items de label 1 dans la gallery
+    # }
+    # on fait ce calcul une seule fois plutot que pour chaque requête 
+    # (ces totaux sont utilisés pour normaliser recall et map)
 
+    # initialise des listes pour stocker scores par requêtes :
     prec_at_k = {k: [] for k in k_values}
     rec_at_k = {k: [] for k in k_values}
     ap_list = []
 
+    ##### IMPORTANT
+    # pour chaque requête i, récupère les labels des max_k plus proches voisins trouvés
     for i in range(len(query_labels)):
         top_k_labels = gallery_labels[indices[i]]
-        relevance = (top_k_labels == query_labels[i]).astype(float)
+        # on recupere les vrais labels des 20 voisins trouvés par FAISS pour la requête i
+        # suite exemple pour la requête i = 0 (label =1)
+        # indices[0]     = [4821, 312, 7043, 18, 9901, 55, 302, ...]
+        # top_k_labels   = [1,    0,   1,    1,  0,    1,  0,   ...]
+
+
+        relevance = (top_k_labels == query_labels[i]).astype(float) 
+        # on compare chaque label voisin avec le label de la requête. 1.0 = même label (pertinent), 0.0 = label différent
+        # suite example : 
+        # relevance = [1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, ...]
+
         n_relevant = label_counts.get(query_labels[i], 0)
+        # c'est le nombre d'élements dans la gallerie qui ont le même label que notre requete i 
+        # dans notre exemple, on a dit que query_labels[0] = 1, donc le premier query est de label positif alors n_relevant = label_counts[1] = 4000
+        # si le label n'existe pas dans la galerie, 0 est renvoyé 
 
         if n_relevant == 0:
             continue
+        # Si le label de cette requête n'existe pas du tout dans la gallery, on saute — les métriques seraient indéfinies.
 
-        for k in k_values:
-            top_k = relevance[:k]
+        for k in k_values: #  k = 5, 10, 20
+            top_k = relevance[:k]   # on tronque le vecteur de pertinence à k
             prec_at_k[k].append(top_k.mean())
             rec_at_k[k].append(top_k.sum() / n_relevant)
+
+            # exemple
+            # avec relevance = [1, 0, 1, 1, 0, 1, 0, 1, 0, 1, ...] et n_relevant = 4000
+            # pour k = 5 : Precision@5 = mean([1,0,1,1,0]) = (1 + 0 + 1 + 1 + 0) / 5 = 3/5 = 0.6 
+            # Recall@5    = sum([1,0,1,1,0])/4000 = 3/4000 = 0.00075 
+            
+            # pour k = 10   
+            # Precision@10 = 6/10  = 0.60
+            # Recall@10    = 6/4000 = 0.0015
+            # Le recall est très petit car même 6 pertinents sur 4000 c'est peu. C'est normal et attendu
 
         # Average Precision (truncated at max_k)
         cumsum = np.cumsum(relevance)
@@ -369,11 +526,29 @@ def eval_retrieval(query_embs, query_labels, gallery_embs, gallery_labels, k_val
         ap = ((cumsum / ranks) * relevance).sum() / n_relevant
         ap_list.append(ap)
 
+        # exemple 
+        # Prenons relevance = [1, 0, 1, 1, 0, 0, 1, 0, 0, 0, ...] sur 10 positions :
+        # ranks     = [1,  2,  3,  4,  5,  6,  7,  8,  9, 10, ...]
+        # cumsum    = [1,  1,  2,  3,  3,  3,  4,  4,  4,  4, ...] (somme  cumulative quand relevance = 1)
+        # cumsum/ranks = [1.0, 0.5, 0.67, 0.75, 0.6, 0.5, 0.57, ...]
+
+
+        # (cumsum/ranks) * relevance : on ne garde que les positions où relevance=1 (les pertinents) :
+        # positions pertinentes : rang 1, 3, 4, 7
+        # precisions à ces rangs : 1.0,  0.67, 0.75, 0.57
+        # AP = moyenne de ces précisions = (1.0 + 0.67 + 0.75 + 0.57) / 4000 (n_relevant)
+
+        # IDEE PRINCIPALE :  si les pertinents arrivent tôt (rangs 1, 2, 3), les précisions sont élevées (1.0, 1.0, 1.0) → AP proche de 1. 
+        # S'ils arrivent tard (rangs 18, 19, 20), les précisions sont faibles (0.05, 0.10, 0.15) → AP proche de 0.
+
     results = {}
     for k in k_values:
         results[f"precision@{k}"] = float(np.mean(prec_at_k[k])) if prec_at_k[k] else 0.0
         results[f"recall@{k}"] = float(np.mean(rec_at_k[k])) if rec_at_k[k] else 0.0
     results["mAP"] = float(np.mean(ap_list)) if ap_list else 0.0
+    # On fait la moyenne de chaque métrique sur toutes les requêtes. 
+    # exemple : si on avait 100 requêtes, precision@5 est la moyenne des 100 P@5 individuels.
+    # C'est la mean de mAP qui lui donne son nom (mean Average Precision).
 
     return results
 
@@ -447,8 +622,13 @@ def eval_classifier_head(classifier, train_dataloader, test_dataloader, device, 
 # UMAP VISUALIZATION
 # ============================================================================
 
-def _extract_from_dataloader(embedding_model, dataloader, device, sample_size=None):
-    """Extract embeddings, labels, patient_ids from a dataloader."""
+def _extract_from_dataloader(embedding_model, dataloader, device, sample_size=None, seizure_types=None):
+    """Extract embeddings, labels, patient_ids from a dataloader.
+
+    seizure_types (optional): array aligned with the dataloader's underlying
+    dataset (same order), only valid when the dataloader iterates with
+    shuffle=False. Subsampled along with the rest when sample_size is set.
+    """
     embedding_model.eval()
     encoded_data, labels, patient_ids = [], [], []
 
@@ -473,6 +653,9 @@ def _extract_from_dataloader(embedding_model, dataloader, device, sample_size=No
     labels = np.array(labels)
     patient_ids = np.array(patient_ids)
 
+    if seizure_types is not None:
+        seizure_types = np.asarray(seizure_types, dtype=object)[:len(encoded_data)]
+
     if sample_size is not None and len(encoded_data) > sample_size:
         # Keep all seizure samples (up to sample_size), fill the rest with no-seizure.
         # Cap seizure at 10% of sample_size to avoid distorting UMAP neighborhoods.
@@ -490,25 +673,29 @@ def _extract_from_dataloader(embedding_model, dataloader, device, sample_size=No
         idx = np.concatenate([minority_idx, majority_idx])
         np.random.shuffle(idx)
         encoded_data, labels, patient_ids = encoded_data[idx], labels[idx], patient_ids[idx]
+        if seizure_types is not None:
+            seizure_types = seizure_types[idx]
 
-    return encoded_data, labels, patient_ids
+    return encoded_data, labels, patient_ids, seizure_types
 
 
 def generate_umap_visualizations(embedding_model, dataloader, device, results_dir,
-                                 sample_size=None, prefix='umap', test_dataloader=None):
+                                 sample_size=None, prefix='umap', test_dataloader=None,
+                                 pid_map=None, seizure_types=None, test_seizure_types=None):
     """Generate UMAP plots. UMAP is fit on train data; test is projected into the same space."""
     logging.info(f"Generating UMAP visualizations ({prefix})...")
 
-    encoded_data, labels, patient_ids = _extract_from_dataloader(
-        embedding_model, dataloader, device, sample_size)
+    encoded_data, labels, patient_ids, seizure_types = _extract_from_dataloader(
+        embedding_model, dataloader, device, sample_size, seizure_types=seizure_types)
 
-    test_data, test_labels, test_pids = None, None, None
+    test_data, test_labels, test_pids, test_seizure_types_out = None, None, None, None
     if test_dataloader is not None:
-        test_data, test_labels, test_pids = _extract_from_dataloader(
-            embedding_model, test_dataloader, device, sample_size)
+        test_data, test_labels, test_pids, test_seizure_types_out = _extract_from_dataloader(
+            embedding_model, test_dataloader, device, sample_size, seizure_types=test_seizure_types)
 
     visualize_umap(encoded_data, labels, patient_ids, results_dir, prefix=prefix,
-                   test_data=test_data, test_labels=test_labels, test_patient_ids=test_pids)
+                   test_data=test_data, test_labels=test_labels, test_patient_ids=test_pids,
+                   pid_map=pid_map, seizure_types=seizure_types, test_seizure_types=test_seizure_types_out)
     logging.info("UMAP visualizations completed!\n")
 
 
@@ -635,12 +822,14 @@ def generate_report(results_dir):
             umap_html += img_row(
                 (f"{phase_prefix}_labels.png", "by label"),
                 (f"{phase_prefix}_patient_ids.png", "by patient"),
+                (f"{phase_prefix}_seizure_type.png", "by seizure type"),
             )
         if test_exists:
             umap_html += f"<h3>{phase_title} — Test (same UMAP space)</h3>"
             umap_html += img_row(
                 (f"{phase_prefix}_test_labels.png", "by label"),
                 (f"{phase_prefix}_test_patient_ids.png", "by patient"),
+                (f"{phase_prefix}_test_seizure_type.png", "by seizure type"),
             )
     classifier_html = img_row(
         ("classifier_training_history.png", "Classifier training history"),
@@ -751,7 +940,8 @@ def main():
 
     # --- Load data ---
     logging.info("Loading data...")
-    train_feats, train_labels, train_pids, test_feats, test_labels, test_pids = load_data(config)
+    (train_feats, train_labels, train_pids, train_seizure_types,
+     test_feats, test_labels, test_pids, test_seizure_types) = load_data(config)
 
     # --- Build and load model ---
     model_cfg = config["model_config"]
@@ -827,9 +1017,9 @@ def main():
         logging.info(f"\n{'='*60}\nUMAP Visualizations (fine-tuned embedding)\n{'='*60}")
         sample = args.umap_sample_size
 
-        def _subsample_keep_minority(embs, labels, pids, n):
+        def _subsample_keep_minority(embs, labels, pids, n, seizure_types=None):
             if n is None or len(embs) <= n:
-                return embs, labels, pids
+                return embs, labels, pids, seizure_types
             minority_idx = np.where(labels == 1)[0]
             majority_idx = np.where(labels != 1)[0]
             max_minority = min(len(minority_idx), n // 10)
@@ -840,16 +1030,18 @@ def main():
                 majority_idx = np.random.choice(majority_idx, n_majority, replace=False)
             idx = np.concatenate([minority_idx, majority_idx])
             np.random.shuffle(idx)
-            return embs[idx], labels[idx], pids[idx]
+            sz = seizure_types[idx] if seizure_types is not None else None
+            return embs[idx], labels[idx], pids[idx], sz
 
-        train_viz, train_lbl_viz, train_pid_viz = _subsample_keep_minority(
-            train_embs, train_labels_np, train_pids_np, sample)
-        test_viz, test_lbl_viz, test_pid_viz = _subsample_keep_minority(
-            test_embs, test_labels_np, test_pids_np, sample)
+        train_viz, train_lbl_viz, train_pid_viz, train_sz_viz = _subsample_keep_minority(
+            train_embs, train_labels_np, train_pids_np, sample, train_seizure_types)
+        test_viz, test_lbl_viz, test_pid_viz, test_sz_viz = _subsample_keep_minority(
+            test_embs, test_labels_np, test_pids_np, sample, test_seizure_types)
 
         visualize_umap(train_viz, train_lbl_viz, train_pid_viz, args.results_dir,
                        prefix='umap_eval',
-                       test_data=test_viz, test_labels=test_lbl_viz, test_patient_ids=test_pid_viz)
+                       test_data=test_viz, test_labels=test_lbl_viz, test_patient_ids=test_pid_viz,
+                       seizure_types=train_sz_viz, test_seizure_types=test_sz_viz)
     elif not args.no_umap:
         logging.info("Skipping eval UMAP — no fine-tuned embedding, same as Phase 1 pretrain UMAP")
 
